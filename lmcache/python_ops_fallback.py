@@ -297,6 +297,10 @@ class EngineKVFormat(IntEnum):
     # second-to-last, recovered by splitting the fused [..., 2 * head_size].
     NL_X_NB_NH_BS_TWO_HS = 10
 
+    # used by: vLLM 0.23 non-MLA NHD blocks-first attention. Per-layer
+    # physical shape [num_blocks, block_size, 2, num_heads, head_size].
+    NL_X_NB_BS_TWO_NH_HS = 11
+
 
 # Backward-compat alias
 GPUKVFormat = EngineKVFormat
@@ -613,12 +617,15 @@ def multi_layer_kv_transfer(
         int(EngineKVFormat.NL_X_NBBS_ONE_HS),
     )
     is_flash_infer = int(engine_kv_format) == int(EngineKVFormat.NL_X_NB_TWO_BS_NH_HS)
+    is_token_major_flash_infer = int(engine_kv_format) == int(
+        EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+    )
 
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
     # For the flash_infer interleaved layout, pre-compute block-level indices.
-    if is_flash_infer:
+    if is_flash_infer or is_token_major_flash_infer:
         block_indices = valid_slots // block_size
         block_offsets = valid_slots % block_size
 
@@ -631,6 +638,9 @@ def multi_layer_kv_transfer(
     elif is_flash_infer:
         num_blocks = page_buffer_size // block_size
         layer_shape = (num_blocks, 2, block_size, hidden_size)
+    elif is_token_major_flash_infer:
+        num_blocks = page_buffer_size // block_size
+        layer_shape = (num_blocks, block_size, 2, hidden_size)
     else:
         layer_shape = (2, page_buffer_size, hidden_size)
 
@@ -671,6 +681,18 @@ def multi_layer_kv_transfer(
             else:
                 gathered = paged_tensor[block_indices, :, block_offsets, :]
                 # gathered: [num_valid, 2, hidden_size]
+                key_value[:, layer_id, valid_mask_kv, :] = gathered.to(
+                    kv_device, non_blocking=False
+                ).transpose(0, 1)
+        elif is_token_major_flash_infer:
+            # Paged layout : [num_blocks, block_size, 2, hidden_size]
+            # key_value layout: [2, num_layers, num_tokens, hidden_size]
+            if int(direction) == int(TransferDirection.H2D):
+                lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                src_data = lmc_valid.transpose(0, 1).to(paged_memory_device)
+                paged_tensor[block_indices, block_offsets, :, :] = src_data
+            else:
+                gathered = paged_tensor[block_indices, block_offsets, :, :]
                 key_value[:, layer_id, valid_mask_kv, :] = gathered.to(
                     kv_device, non_blocking=False
                 ).transpose(0, 1)
@@ -858,6 +880,8 @@ def _per_layer_paged_shape(
         # vLLM CPU blocks-first fused KV: K and V interleaved at the
         # second-to-last dim so each layer is [NB, NH, BS, 2, HS].
         return (nb, nh, bs, 2, hs)
+    if fmt == int(EngineKVFormat.NL_X_NB_BS_TWO_NH_HS):
+        return (nb, bs, 2, nh, hs)
     if fmt == int(EngineKVFormat.NL_X_TWO_NB_BS_NH_HS):
         return (2, nb, bs, nh, hs)
     if fmt == int(EngineKVFormat.NL_X_NB_NH_BS_TWO_HS):
@@ -1671,6 +1695,8 @@ def _transfer_per_layer_nhd(
     first_layer = layer_tensors[0]
     if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_BS_NH_HS):
         first_k = first_layer[0]
+    elif int(engine_kv_format) == int(EngineKVFormat.NL_X_NB_BS_TWO_NH_HS):
+        first_k = first_layer[:, :, 0]
     else:
         first_k = first_layer[:, 0]
     _nb0, _bs0, nh0, hs0 = first_k.shape
@@ -1714,6 +1740,16 @@ def _transfer_per_layer_nhd(
                         eff_idx,
                         out=chunk_gpu[1, layer_idx].view(n_valid, block_size, nh0, hs0),
                     )
+                elif int(engine_kv_format) == int(
+                    EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+                ):
+                    selected = layer.index_select(0, eff_idx)
+                    chunk_gpu[0, layer_idx].copy_(
+                        selected[:, :, 0].reshape(n_valid * block_size, nh0 * hs0)
+                    )
+                    chunk_gpu[1, layer_idx].copy_(
+                        selected[:, :, 1].reshape(n_valid * block_size, nh0 * hs0)
+                    )
                 else:
                     # FlashInfer NHD stores KV as [NB, 2, BS, NH, HS].
                     # Gather on dim=0 first to avoid index_select from
@@ -1743,6 +1779,18 @@ def _transfer_per_layer_nhd(
                         0,
                         eff_idx,
                         chunk_gpu[1, layer_idx].reshape(n_valid, block_size, nh0, hs0),
+                    )
+                elif int(engine_kv_format) == int(
+                    EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+                ):
+                    k_blocks = chunk_gpu[0, layer_idx].reshape(
+                        n_valid, block_size, nh0, hs0
+                    )
+                    v_blocks = chunk_gpu[1, layer_idx].reshape(
+                        n_valid, block_size, nh0, hs0
+                    )
+                    layer.index_copy_(
+                        0, eff_idx, torch.stack([k_blocks, v_blocks], dim=2)
                     )
                 else:
                     k_blocks = chunk_gpu[0, layer_idx].reshape(
@@ -1781,6 +1829,8 @@ def single_layer_kv_transfer(
             [2, num_blocks, block_size, num_heads, head_size]
         - NL_X_NB_TWO_BS_NH_HS (flash infer):
             [num_blocks, 2, block_size, num_heads, head_size]
+        - NL_X_NB_BS_TWO_NH_HS (vLLM 0.23 token-major flash infer):
+            [num_blocks, block_size, 2, num_heads, head_size]
         - NL_X_NB_BS_HS (vLLM MLA):
             [num_blocks, block_size, head_size]
 
@@ -1827,15 +1877,23 @@ def single_layer_kv_transfer(
         # ── Non-MLA format ──
         # Determine vLLM layout and block_size
         is_two_major = int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_BS_NH_HS)
+        is_token_major_flash_infer = int(engine_kv_format) == int(
+            EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+        )
         # flash attn:
         #   [2, num_blocks, block_size, num_heads, head_size]
         #   -> dim2 = block_size
         # flash infer:
         #   [num_blocks, 2, block_size, num_heads, head_size]
         #   -> dim2 = block_size
-        block_size = vllm_key_value_cache.size(2)
-        num_heads = vllm_key_value_cache.size(3)
-        head_size = vllm_key_value_cache.size(4)
+        if is_token_major_flash_infer:
+            block_size = vllm_key_value_cache.size(1)
+            num_heads = vllm_key_value_cache.size(3)
+            head_size = vllm_key_value_cache.size(4)
+        else:
+            block_size = vllm_key_value_cache.size(2)
+            num_heads = vllm_key_value_cache.size(3)
+            head_size = vllm_key_value_cache.size(4)
         block_indices = valid_slots // block_size
         block_offsets = valid_slots % block_size
 
@@ -1843,6 +1901,8 @@ def single_layer_kv_transfer(
             if int(direction) == int(TransferDirection.D2H):
                 if is_two_major:
                     gathered = vllm_key_value_cache[kv, block_indices, block_offsets]
+                elif is_token_major_flash_infer:
+                    gathered = vllm_key_value_cache[block_indices, block_offsets, kv]
                 else:
                     gathered = vllm_key_value_cache[block_indices, kv, block_offsets]
 
@@ -1864,6 +1924,10 @@ def single_layer_kv_transfer(
 
                 if is_two_major:
                     vllm_key_value_cache[kv, block_indices, block_offsets] = (
+                        lmc_reshaped
+                    )
+                elif is_token_major_flash_infer:
+                    vllm_key_value_cache[block_indices, block_offsets, kv] = (
                         lmc_reshaped
                     )
                 else:

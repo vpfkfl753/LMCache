@@ -833,6 +833,10 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
         (ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, False, True, False),
         (ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, False, False, False),
         (ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, False, True, True),
+        # vLLM 0.23 token-major flash infer: [NB, BS, 2, NH, HS]
+        (ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS, False, True, False),
+        (ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS, False, False, False),
+        (ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS, False, True, True),
         # vLLM MLA: [NB, BS, HS]
         (ops.EngineKVFormat.NL_X_NB_BS_HS, True, True, False),
         (ops.EngineKVFormat.NL_X_NB_BS_HS, True, True, True),
@@ -841,6 +845,9 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
     for engine_kv_format, is_mla, token_major, direction in test_cases:
         dir_tag = "v2l" if direction else "l2v"
         is_two_major = engine_kv_format == ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+        is_token_major_flash_infer = (
+            engine_kv_format == ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+        )
         case_desc = (
             f"fmt={engine_kv_format}, MLA={is_mla}, TM={token_major}, Dir={dir_tag}"
         )
@@ -860,6 +867,9 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
             if is_two_major:
                 # flash attn: [2, num_blocks, block_size, num_heads, head_size]
                 vllm_shape = (2, num_blocks, block_size, num_heads, head_size)
+            elif is_token_major_flash_infer:
+                # vLLM 0.23: [num_blocks, block_size, 2, num_heads, head_size]
+                vllm_shape = (num_blocks, block_size, 2, num_heads, head_size)
             else:
                 # flash infer: [num_blocks, 2, block_size, num_heads, head_size]
                 vllm_shape = (num_blocks, 2, block_size, num_heads, head_size)
@@ -899,6 +909,10 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
                     # [2, NB, BS, NH, HS]
                     vllm_ref[0, block_indices, block_offsets] = src[:, 0, :, :]
                     vllm_ref[1, block_indices, block_offsets] = src[:, 1, :, :]
+                elif is_token_major_flash_infer:
+                    # [NB, BS, 2, NH, HS]
+                    vllm_ref[block_indices, block_offsets, 0] = src[:, 0, :, :]
+                    vllm_ref[block_indices, block_offsets, 1] = src[:, 1, :, :]
                 else:
                     # [NB, 2, BS, NH, HS]
                     vllm_ref[block_indices, 0, block_offsets] = src[:, 0, :, :]
@@ -910,6 +924,9 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
                 if is_two_major:
                     k = vllm_ref[0, block_indices, block_offsets]
                     v = vllm_ref[1, block_indices, block_offsets]
+                elif is_token_major_flash_infer:
+                    k = vllm_ref[block_indices, block_offsets, 0]
+                    v = vllm_ref[block_indices, block_offsets, 1]
                 else:
                     k = vllm_ref[block_indices, 0, block_offsets]
                     v = vllm_ref[block_indices, 1, block_offsets]
@@ -1183,6 +1200,11 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
         (ops.EngineKVFormat.NB_NL_TWO_BS_NH_HS, False, 1),  # vLLM cross layer
         (ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS, False, 1),  # flash attn
         (ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, False, block_size),  # flash infer
+        (
+            ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS,
+            False,
+            block_size,
+        ),  # vLLM 0.23 token-major flash infer
         (ops.EngineKVFormat.NL_X_NB_BS_HS, True, 1),  # vLLM MLA
         (ops.EngineKVFormat.NL_X_NBBS_ONE_HS, True, 1),  # SGLang MLA
     ]
@@ -1227,6 +1249,13 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                         dtype=dtype,
                         device=device,
                     )
+                elif engine_kv_format == ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS:
+                    num_blocks = page_buffer_size // bs_arg
+                    pb = torch.zeros(
+                        (num_blocks, bs_arg, 2, head_size),
+                        dtype=dtype,
+                        device=device,
+                    )
                 elif is_mla:
                     pb = torch.zeros(
                         (page_buffer_size, head_size),
@@ -1257,6 +1286,13 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                                 blk_idx = s // bs_arg
                                 blk_off = s % bs_arg
                                 pb[blk_idx, kv, blk_off] = val
+                            elif (
+                                engine_kv_format
+                                == ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+                            ):
+                                blk_idx = s // bs_arg
+                                blk_off = s % bs_arg
+                                pb[blk_idx, blk_off, kv] = val
                             elif is_mla:
                                 pb[s] = val
                             else:
@@ -1305,6 +1341,13 @@ def scenario_multi_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.T
                             blk_idx = s_idx // bs_arg
                             blk_off = s_idx % bs_arg
                             paged_val = page_buffers[ly][blk_idx, kv, blk_off]
+                        elif (
+                            engine_kv_format
+                            == ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+                        ):
+                            blk_idx = s_idx // bs_arg
+                            blk_off = s_idx % bs_arg
+                            paged_val = page_buffers[ly][blk_idx, blk_off, kv]
                         elif is_mla:
                             paged_val = page_buffers[ly][s_idx]
                         else:
@@ -1962,6 +2005,67 @@ def scenario_multi_layer_block_kv_transfer(
         results[f"flashinfer_nhd_layer{i}"] = torch.stack([orig, recon])
         assert torch.allclose(orig, recon, atol=1e-6), (
             f"FlashInfer NHD Layer {i} round-trip mismatch"
+        )
+
+    # --- vLLM 0.23 token-major NHD per-layer ---
+    torch.manual_seed(345)
+    paged_layers_token_major_nhd = [
+        torch.randn(num_blocks, block_size, 2, num_heads, head_size, dtype=dtype).to(
+            device
+        )
+        for _ in range(num_layers)
+    ]
+    engine_kv_format_token_major_nhd = ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS
+    d2h_chunks_token_major_nhd = _alloc_chunks(
+        (2, num_layers, chunk_tokens, hidden_dim), num_chunks
+    )
+    ops.multi_layer_block_kv_transfer(
+        paged_layers_token_major_nhd
+        if use_tensor_list
+        else torch.tensor(
+            [layer.data_ptr() for layer in paged_layers_token_major_nhd],
+            dtype=torch.uint64,
+            device=device,
+        ),
+        d2h_chunks_token_major_nhd
+        if use_tensor_list
+        else [c.data_ptr() for c in d2h_chunks_token_major_nhd],
+        torch.tensor(block_ids, dtype=torch.int64, device=device),
+        torch.device(device),
+        ops.TransferDirection.D2H,
+        shape_desc,
+        chunk_tokens,
+        engine_kv_format_token_major_nhd,
+        0,
+    )
+    paged_h2d_token_major_nhd = [
+        torch.zeros_like(layer) for layer in paged_layers_token_major_nhd
+    ]
+    ops.multi_layer_block_kv_transfer(
+        paged_h2d_token_major_nhd
+        if use_tensor_list
+        else torch.tensor(
+            [layer.data_ptr() for layer in paged_h2d_token_major_nhd],
+            dtype=torch.uint64,
+            device=device,
+        ),
+        d2h_chunks_token_major_nhd
+        if use_tensor_list
+        else [c.data_ptr() for c in d2h_chunks_token_major_nhd],
+        torch.tensor(block_ids, dtype=torch.int64, device=device),
+        torch.device(device),
+        ops.TransferDirection.H2D,
+        shape_desc,
+        chunk_tokens,
+        engine_kv_format_token_major_nhd,
+        0,
+    )
+    for i in range(num_layers):
+        orig = paged_layers_token_major_nhd[i].cpu()
+        recon = paged_h2d_token_major_nhd[i].cpu()
+        results[f"token_major_nhd_layer{i}"] = torch.stack([orig, recon])
+        assert torch.allclose(orig, recon, atol=1e-6), (
+            f"Token-major NHD Layer {i} round-trip mismatch"
         )
 
     # --- HND per-layer ---

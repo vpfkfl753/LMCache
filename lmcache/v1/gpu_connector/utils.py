@@ -422,6 +422,7 @@ def assert_is_vllm_flash_attn_or_flash_infer(
     assert engine_kv_format in (
         lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS,
         lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         # Blocks-first fused K/V (vLLM CPU): a per-layer non-MLA layout that
@@ -440,6 +441,7 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
     Accepted formats:
         - ``NL_X_TWO_NB_BS_NH_HS`` (flash attention, NHD)
         - ``NL_X_NB_TWO_BS_NH_HS`` (flash infer, NHD)
+        - ``NL_X_NB_BS_TWO_NH_HS`` (vLLM 0.23 token-major NHD)
         - ``NL_X_TWO_NB_NH_BS_HS`` (flash attention, HND)
         - ``NL_X_NB_TWO_NH_BS_HS`` (flash infer, HND)
         - ``NL_X_NB_BS_HS`` (MLA)
@@ -450,6 +452,7 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
     assert engine_kv_format in (
         lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS,
         lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         lmc_ops.EngineKVFormat.NL_X_NB_BS_HS,
@@ -756,6 +759,14 @@ def _get_head_size_view(
                 )
             k, v = t[:, 0], t[:, 1]  # [NB,BS,NH,HS]
 
+        elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS:
+            # per-layer: [NB, BS, 2, NH, HS]
+            if t.shape[2] != 2:
+                raise ValueError(
+                    f"{engine_kv_format} expects [NB,BS,2,NH,HS], got {t.shape}"
+                )
+            k, v = t[:, :, 0], t[:, :, 1]  # [NB,BS,NH,HS]
+
         else:
             # Other formats are either MLA-only or require upstream normalization.
             raise NotImplementedError(
@@ -771,10 +782,12 @@ def _get_head_size_view(
             k, v = t[0], t[1]
         elif t.shape[1] == 2:
             k, v = t[:, 0], t[:, 1]
+        elif t.shape[2] == 2:
+            k, v = t[:, :, 0], t[:, :, 1]
         else:
             raise ValueError(
                 f"engine_kv_format is None and tensor does not look like stacked KV. "
-                f"Expected axis0==2 or axis1==2, got {t.shape}"
+                f"Expected axis0==2, axis1==2, or axis2==2, got {t.shape}"
             )
 
     if k.dim() != 4 or v.dim() != 4:

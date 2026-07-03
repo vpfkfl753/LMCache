@@ -62,6 +62,21 @@ def test_make_shape_desc_vllm_flash_infer_nhd():
     assert sd.kv_size == 2
 
 
+def test_make_shape_desc_vllm_023_token_major_nhd():
+    kv_caches = [torch.empty(32, 16, 2, 8, 64, dtype=torch.float16) for _ in range(2)]
+    sd = make_page_buffer_shape_desc(
+        kv_caches,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS,
+        layer_idx=0,
+        num_layers_in_group=2,
+        num_blocks=32,
+        block_size=16,
+    )
+    assert sd.nh == 8
+    assert sd.hs == 64
+    assert sd.kv_size == 2
+
+
 def test_make_shape_desc_vllm_mla():
     kv_caches = [torch.empty(32, 16, 512, dtype=torch.bfloat16) for _ in range(3)]
     sd = make_page_buffer_shape_desc(

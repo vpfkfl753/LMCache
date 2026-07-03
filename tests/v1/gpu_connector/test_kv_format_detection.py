@@ -56,6 +56,15 @@ def test_vllm_flash_infer_nhd(monkeypatch):
     assert fmt == F.NL_X_NB_TWO_BS_NH_HS
 
 
+def test_vllm_023_blocks_first_kv_axis_third_nhd(monkeypatch):
+    monkeypatch.setattr(_VLLM_DEV, "cuda")
+    kv = [_t(NB, BS, 2, NH, HS) for _ in range(NL)]
+    fmt, out = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+    assert fmt == F.NL_X_NB_BS_TWO_NH_HS
+    assert tuple(out[0].shape) == (NB, BS, 2, NH, HS)
+    assert out[0] is kv[0]
+
+
 def test_vllm_mla():
     kv = [_t(NB, BS, HS) for _ in range(NL)]
     fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})

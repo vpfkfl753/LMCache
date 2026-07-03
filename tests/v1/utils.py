@@ -47,6 +47,7 @@ if lmc_ops is None:
         NL_X_TWO_NB_NH_BS_HS = 3
         NL_X_NB_TWO_NH_BS_HS = 4
         NL_X_NB_NH_BS_TWO_HS = 5
+        NL_X_NB_BS_TWO_NH_HS = 6
 
     class MockCOps:
         EngineKVFormat = MockEngineKVFormat
@@ -309,6 +310,8 @@ def generate_kv_cache_paged_list_tensors(
             shape = [2, num_blocks, block_size, num_heads, head_size]
         elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS:
             shape = [num_blocks, 2, block_size, num_heads, head_size]
+        elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS:
+            shape = [num_blocks, block_size, 2, num_heads, head_size]
         elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS:
             shape = [2, num_blocks, num_heads, block_size, head_size]
         elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS:
@@ -485,6 +488,36 @@ def check_paged_kv_cache_equal(
             )
             right_v = (
                 right_kv_layer[:, 1].contiguous().reshape(-1, num_heads, head_size)
+            )
+
+            assert len(left_k.shape) == 3
+            assert len(left_v.shape) == 3
+            assert len(right_k.shape) == 3
+            assert len(right_v.shape) == 3
+
+            assert left_k.shape[token_dim] >= num_tokens
+            assert left_v.shape[token_dim] >= num_tokens
+            assert right_k.shape[token_dim] >= num_tokens
+            assert right_v.shape[token_dim] >= num_tokens
+
+            assert (left_k[slot_mapping, :, :] == right_k[slot_mapping, :, :]).all()
+            assert (left_v[slot_mapping, :, :] == right_v[slot_mapping, :, :]).all()
+
+    elif engine_kv_format == lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS:
+        token_dim = 0
+        num_tokens = slot_mapping.shape[0]
+        for left_kv_layer, right_kv_layer in zip(left, right, strict=False):
+            left_k = left_kv_layer[:, :, 0].contiguous().reshape(
+                -1, num_heads, head_size
+            )
+            left_v = left_kv_layer[:, :, 1].contiguous().reshape(
+                -1, num_heads, head_size
+            )
+            right_k = right_kv_layer[:, :, 0].contiguous().reshape(
+                -1, num_heads, head_size
+            )
+            right_v = right_kv_layer[:, :, 1].contiguous().reshape(
+                -1, num_heads, head_size
             )
 
             assert len(left_k.shape) == 3

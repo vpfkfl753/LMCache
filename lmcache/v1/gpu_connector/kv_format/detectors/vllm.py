@@ -10,6 +10,7 @@ import torch
 
 # First Party
 from lmcache import torch_device_type
+from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.kv_format.detectors.base import (
     EngineDetector,
@@ -17,6 +18,8 @@ from lmcache.v1.gpu_connector.kv_format.detectors.base import (
 )
 from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache, LayoutHints
 import lmcache.c_ops as lmc_ops
+
+logger = init_logger(__name__)
 
 
 class VLLM_Detector(EngineDetector):
@@ -67,6 +70,21 @@ class VLLM_Detector(EngineDetector):
                 if is_hnd:
                     return lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS, kv_caches
                 return lmc_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS, kv_caches
+            if first_tensor.shape[2] == 2:  # vLLM 0.23: [NB, BS/NH, 2, NH/BS, HS]
+                if is_hnd:
+                    return lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS, [
+                        t.permute(0, 2, 1, 3, 4) for t in kv_caches
+                    ]
+                return lmc_ops.EngineKVFormat.NL_X_NB_BS_TWO_NH_HS, kv_caches
         if list_depth == 1 and tensor_ndim == 3:  # MLA
             return lmc_ops.EngineKVFormat.NL_X_NB_BS_HS, kv_caches
+        logger.info(
+            "Unsupported vLLM KV cache layout: list_depth=%s tensor_ndim=%s "
+            "shape=%s stride=%s layout_hints=%s",
+            list_depth,
+            tensor_ndim,
+            tuple(first_tensor.shape),
+            tuple(first_tensor.stride()),
+            dict(layout_hints),
+        )
         return None, kv_caches
