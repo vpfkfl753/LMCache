@@ -19,6 +19,7 @@ from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
+    CBMatchResult,
     IPCCacheServerKey,
     KVCache,
 )
@@ -28,6 +29,11 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.span_lookup import (
+    SpanLookupResult,
+    intersect_span_lookup_results,
+    span_lookup_result_from_cb_unified_lookup,
+)
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -37,6 +43,158 @@ from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSum
 from lmcache.v1.platform import _registry as platform_registry
 
 logger = init_logger(__name__)
+
+
+
+_COHERENTKV_TRUE_STRINGS = {"1", "true", "yes", "y", "ok", "pass", "validated"}
+
+
+def _coherentkv_metadata_truthy(metadata: Any, *keys: str) -> bool:
+    if not hasattr(metadata, "get"):
+        return False
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        if isinstance(value, (int, float)):
+            if bool(value):
+                return True
+            continue
+        if value is not None and str(value).strip().lower() in _COHERENTKV_TRUE_STRINGS:
+            return True
+    return False
+
+
+def _coherentkv_validate_cb_v3_publish_span_metadata(
+    span_loads: Any,
+) -> tuple[bool, list[str]]:
+    """Fail-closed proof gate before lowering spans to Blend V3 matches.
+
+    The worker submit path can only publish non-prefix KV when every span has:
+    destination blocks, CB hash metadata, an admission proof, recompute-gap proof,
+    and a parity proof artifact.  Missing or malformed metadata means the caller
+    must recompute instead of publishing.
+    """
+
+    if not span_loads:
+        return False, ["no_span_loads"]
+
+    errors: list[str] = []
+    for index, span_load in enumerate(span_loads):
+        metadata = getattr(span_load, "metadata", None) or {}
+        if not hasattr(metadata, "get"):
+            errors.append(f"span_{index}:metadata_not_mapping")
+            metadata = {}
+
+        hash_hex = metadata.get("coherentkv_cb_hash_hex") or metadata.get("cb_hash_hex")
+        if not hash_hex:
+            errors.append(f"span_{index}:missing_cb_hash")
+
+        by_group = getattr(span_load, "destination_block_ids_by_group", ())
+        flat = getattr(span_load, "destination_block_ids", ())
+        if not by_group and not flat:
+            errors.append(f"span_{index}:missing_destination_blocks")
+
+        try:
+            old_st = int(getattr(span_load, "source_start_token"))
+            old_ed = int(getattr(span_load, "source_end_token"))
+            cur_st = int(getattr(span_load, "destination_start_token"))
+            cur_ed = int(getattr(span_load, "destination_end_token"))
+        except (AttributeError, TypeError, ValueError):
+            errors.append(f"span_{index}:invalid_or_missing_range")
+        else:
+            if old_ed <= old_st or cur_ed <= cur_st or old_ed - old_st != cur_ed - cur_st:
+                errors.append(f"span_{index}:invalid_or_mismatched_range")
+
+        if not _coherentkv_metadata_truthy(metadata, "coherentkv_admitted"):
+            errors.append(f"span_{index}:missing_admission_proof")
+        if not _coherentkv_metadata_truthy(
+            metadata,
+            "coherentkv_gap_validated",
+            "coherentkv_recompute_gap_validated",
+        ):
+            errors.append(f"span_{index}:missing_recompute_gap_validation_proof")
+        if not _coherentkv_metadata_truthy(metadata, "coherentkv_parity_validated"):
+            errors.append(f"span_{index}:missing_parity_validation_proof")
+        parity_artifact = metadata.get("coherentkv_parity_artifact_id") or metadata.get(
+            "coherentkv_parity_artifact"
+        )
+        if not parity_artifact:
+            errors.append(f"span_{index}:missing_parity_artifact_id")
+
+    return not errors, errors
+
+def _coherentkv_span_loads_to_cb_matches(
+    span_loads: Any,
+    cb_match_result_cls: Any,
+) -> tuple[tuple[Any, ...], list[str]]:
+    if cb_match_result_cls is None:
+        return (), ["missing_cb_match_result_class"]
+    publish_metadata_valid, publish_metadata_errors = (
+        _coherentkv_validate_cb_v3_publish_span_metadata(span_loads)
+    )
+    if not publish_metadata_valid:
+        return (), publish_metadata_errors
+    matches = []
+    errors = []
+    for index, span_load in enumerate(span_loads or ()):
+        metadata = getattr(span_load, "metadata", None) or {}
+        hash_hex = metadata.get("coherentkv_cb_hash_hex") or metadata.get("cb_hash_hex")
+        if not hash_hex:
+            errors.append(f"span_{index}:missing_cb_hash")
+            continue
+        by_group = getattr(span_load, "destination_block_ids_by_group", ())
+        flat = getattr(span_load, "destination_block_ids", ())
+        if not by_group and not flat:
+            errors.append(f"span_{index}:missing_destination_blocks")
+            continue
+        try:
+            hash_bytes = bytes.fromhex(str(hash_hex))
+        except ValueError:
+            errors.append(f"span_{index}:invalid_cb_hash_hex")
+            continue
+        try:
+            old_st = int(getattr(span_load, "source_start_token"))
+            old_ed = int(getattr(span_load, "source_end_token"))
+            cur_st = int(getattr(span_load, "destination_start_token"))
+            cur_ed = int(getattr(span_load, "destination_end_token"))
+        except (AttributeError, TypeError, ValueError):
+            errors.append(f"span_{index}:invalid_or_missing_range")
+            continue
+        if old_ed <= old_st or cur_ed <= cur_st or old_ed - old_st != cur_ed - cur_st:
+            errors.append(f"span_{index}:invalid_or_mismatched_range")
+            continue
+        matches.append(
+            cb_match_result_cls(
+                old_st=old_st,
+                old_ed=old_ed,
+                cur_st=cur_st,
+                cur_ed=cur_ed,
+                hash=hash_bytes,
+            )
+        )
+    if errors:
+        return (), errors
+    return tuple(matches), []
+
+
+def _coherentkv_validate_cb_rope_registration_inputs(
+    cos_sin_cache: Any,
+    head_size: int,
+) -> list[str]:
+    errors = []
+    if not torch.is_tensor(cos_sin_cache):
+        errors.append("cos_sin_cache_not_tensor")
+    try:
+        normalized_head_size = int(head_size)
+    except (TypeError, ValueError):
+        errors.append("invalid_head_size")
+    else:
+        if normalized_head_size <= 0:
+            errors.append("invalid_head_size")
+    return errors
 
 
 class ExtraConfigDefault(enum.Enum):
@@ -619,6 +777,10 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results: dict[str, int] = {}
         self._per_server_hits: dict[str, dict[str, int]] = {}
         self._lookup_params: dict[str, tuple[list[int], str]] = {}
+        self._pending_cb_unified_lookups: set[str] = set()
+        self._finished_cb_unified_lookup_results: dict[str, SpanLookupResult] = {}
+        self._per_server_cb_unified_results: dict[str, dict[str, SpanLookupResult]] = {}
+        self._cb_unified_lookup_params: dict[str, tuple[list[int], str]] = {}
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -772,6 +934,127 @@ class LMCacheMPSchedulerAdapter:
 
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt)
+
+    def _cb_unified_lookup_key(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        cache_salt: str,
+    ) -> IPCCacheServerKey | None:
+        aligned_end = (
+            len(token_ids) // self.lmcache_tokens_per_chunk
+        ) * self.lmcache_tokens_per_chunk
+        if aligned_end <= 0:
+            return None
+        return self._create_key(
+            token_ids,
+            start=0,
+            end=aligned_end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+        ).no_worker_id_version()
+
+    def _poll_cb_unified_lookup_once(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        cache_salt: str,
+    ) -> SpanLookupResult | None:
+        key = self._cb_unified_lookup_key(request_id, token_ids, cache_salt)
+        if key is None:
+            result = SpanLookupResult.from_prefix_tokens(0)
+            self._finished_cb_unified_lookup_results[request_id] = result
+            return result
+
+        per_server = self._per_server_cb_unified_results.setdefault(request_id, {})
+        unresolved_urls = [u for u in self._server_urls if u not in per_server]
+        futures: dict[str, MessagingFuture[Any]] = {
+            url: send_lmcache_request(
+                self.mq_clients[url],
+                RequestType.CB_UNIFIED_LOOKUP,
+                [key, self.tp_size],
+            )
+            for url in unresolved_urls
+        }
+
+        for url, fut in futures.items():
+            try:
+                response = fut.result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "CB_UNIFIED_LOOKUP to %s timed out. Marking unhealthy.",
+                    url,
+                )
+                self._health_events[url].clear()
+                result = SpanLookupResult.from_prefix_tokens(0)
+                self._finished_cb_unified_lookup_results[request_id] = result
+                return result
+            if response is None:
+                continue
+            per_server[url] = span_lookup_result_from_cb_unified_lookup(response)
+
+        if len(per_server) < len(self._server_urls):
+            return None
+
+        result = intersect_span_lookup_results(list(per_server.values()))
+        self._finished_cb_unified_lookup_results[request_id] = result
+        return result
+
+    @_lmcache_nvtx_annotate
+    def maybe_submit_cb_unified_lookup_request(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        cache_salt: str = "",
+    ) -> None:
+        """Submit/poll a Blend V3 unified lookup request.
+
+        ``CB_UNIFIED_LOOKUP`` is a submit-once, poll-on-recall RPC: the server
+        returns ``None`` until both prefix and sparse matches are resident in L1.
+        This method stores per-server span results and preserves CB chunk hashes
+        in ``SpanLookupResult`` metadata for later CoherentKV admission. It does
+        not retrieve or publish non-prefix KV.
+        """
+        self._ensure_heartbeat_started()
+        if not self.is_healthy:
+            return
+        if request_id in self._finished_cb_unified_lookup_results:
+            return
+        if request_id not in self._pending_cb_unified_lookups:
+            self._pending_cb_unified_lookups.add(request_id)
+            self._cb_unified_lookup_params[request_id] = (token_ids, cache_salt)
+        self._poll_cb_unified_lookup_once(request_id, token_ids, cache_salt)
+
+    @_lmcache_nvtx_annotate
+    def check_cb_unified_lookup_result(
+        self,
+        request_id: str,
+    ) -> SpanLookupResult | None:
+        """Return a completed unified span lookup or ``None`` if still pending."""
+        if request_id in self._finished_cb_unified_lookup_results:
+            return self._finished_cb_unified_lookup_results[request_id]
+        if request_id not in self._pending_cb_unified_lookups:
+            return SpanLookupResult.from_prefix_tokens(0)
+        if not self.is_healthy:
+            return SpanLookupResult.from_prefix_tokens(0)
+        token_ids, cache_salt = self._cb_unified_lookup_params.get(
+            request_id,
+            (None, None),
+        )
+        if token_ids is None:
+            return SpanLookupResult.from_prefix_tokens(0)
+        return self._poll_cb_unified_lookup_once(
+            request_id,
+            token_ids,
+            cache_salt or "",
+        )
+
+    def cleanup_cb_unified_lookup_result(self, request_id: str) -> None:
+        """Clean up unified lookup state for a finished request."""
+        self._pending_cb_unified_lookups.discard(request_id)
+        self._finished_cb_unified_lookup_results.pop(request_id, None)
+        self._per_server_cb_unified_results.pop(request_id, None)
+        self._cb_unified_lookup_params.pop(request_id, None)
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -1116,6 +1399,10 @@ class LMCacheMPWorkerAdapter:
         # Transport context for transfer operations.
         self.transfer_ctx: TransferContext | None = None
 
+        # Optional Blend V3 RoPE state registered after KV cache setup.
+        self._coherentkv_cb_rope_state: tuple[torch.Tensor, int, bool] | None = None
+        self._coherentkv_cb_rope_registered = False
+
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
         # request_id -> (future, block_ids)
@@ -1362,6 +1649,11 @@ class LMCacheMPWorkerAdapter:
 
         try:
             self._send_register_kv_caches_request(self.kv_caches)
+            if self._coherentkv_cb_rope_state is not None:
+                if not self._send_cb_register_rope_v3_state(
+                    *self._coherentkv_cb_rope_state
+                ):
+                    return False
         except ConnectionError:
             logger.exception(
                 "Failed to re-register KV caches after server recovery; "
@@ -1375,6 +1667,111 @@ class LMCacheMPWorkerAdapter:
             )
             return False
         logger.warning("Finished re-registering KV caches after server recovery")
+        return True
+
+    def _send_cb_register_rope_v3_state(
+        self,
+        cos_sin_cache: torch.Tensor,
+        head_size: int,
+        is_neox_style: bool,
+    ) -> bool:
+        errors = _coherentkv_validate_cb_rope_registration_inputs(
+            cos_sin_cache,
+            head_size,
+        )
+        if errors:
+            logger.info("Skipping CoherentKV CB RoPE registration: %s", errors)
+            return False
+        if not self.kv_caches:
+            logger.info(
+                "Skipping CoherentKV CB RoPE registration: KV cache is not registered"
+            )
+            return False
+
+        try:
+            cos_sin_cache_ipc = wrap_one_kv_cache(cos_sin_cache)
+            send_lmcache_request(
+                self.mq_client,
+                RequestType.CB_REGISTER_ROPE_V3,
+                [
+                    self.instance_id,
+                    cos_sin_cache_ipc,
+                    int(head_size),
+                    bool(is_neox_style),
+                ],
+            ).result(timeout=self._mq_timeout)
+        except TimeoutError:
+            logger.warning(
+                "LMCache server did not respond to CB_REGISTER_ROPE_V3 within %ss",
+                self._mq_timeout,
+            )
+            return False
+        except Exception:
+            logger.exception("Failed to register CoherentKV CB RoPE state")
+            return False
+
+        self._coherentkv_cb_rope_registered = True
+        logger.info(
+            "Registered CoherentKV CB RoPE state for instance_id=%d",
+            self.instance_id,
+        )
+        return True
+
+    def register_cb_rope_v3_state(
+        self,
+        cos_sin_cache: torch.Tensor,
+        head_size: int,
+        is_neox_style: bool,
+    ) -> bool:
+        """Register Blend V3 RoPE state for shifted non-prefix retrieval.
+
+        ``REGISTER_KV_CACHE`` must already have succeeded on this instance.
+        The caller is responsible for passing vLLM's actual cos/sin RoPE cache;
+        this method only creates the IPC wrapper and sends the MP request.
+        """
+        if not self.kv_caches:
+            logger.info(
+                "CoherentKV CB RoPE registration requires register_kv_caches first"
+            )
+            return False
+        registered = self._send_cb_register_rope_v3_state(
+            cos_sin_cache,
+            int(head_size),
+            bool(is_neox_style),
+        )
+        if registered:
+            self._coherentkv_cb_rope_state = (
+                cos_sin_cache,
+                int(head_size),
+                bool(is_neox_style),
+            )
+        return registered
+
+    def unregister_cb_rope_v3_state(self, clear_saved_state: bool = True) -> bool:
+        """Drop server-side Blend V3 RoPE state before KV-cache unregister."""
+        if not self._coherentkv_cb_rope_registered:
+            if clear_saved_state:
+                self._coherentkv_cb_rope_state = None
+            return True
+        try:
+            send_lmcache_request(
+                self.mq_client,
+                RequestType.CB_UNREGISTER_ROPE_V3,
+                [self.instance_id],
+            ).result(timeout=self._mq_timeout)
+        except TimeoutError:
+            logger.warning(
+                "LMCache server did not respond to CB_UNREGISTER_ROPE_V3 within %ss",
+                self._mq_timeout,
+            )
+            return False
+        except Exception:
+            logger.exception("Failed to unregister CoherentKV CB RoPE state")
+            return False
+        finally:
+            self._coherentkv_cb_rope_registered = False
+            if clear_saved_state:
+                self._coherentkv_cb_rope_state = None
         return True
 
     @_lmcache_nvtx_annotate
@@ -1479,6 +1876,97 @@ class LMCacheMPWorkerAdapter:
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event
+
+    @_lmcache_nvtx_annotate
+    def submit_cb_retrieve_pre_computed_v3_request(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        span_loads: Any,
+        full_gpu_block_ids: list[int],
+        event: _IpcEvent,
+        cache_salt: str = "",
+    ) -> bool:
+        """Submit a conservative Blend V3 non-prefix retrieve request.
+
+        The normal MP retrieve path already serializes ``event.ipc_handle()``
+        into the server. This method reuses the same event shape for
+        ``CB_RETRIEVE_PRE_COMPUTED_V3`` after lowering span metadata into
+        ``CBMatchResult`` records. If any prerequisite is missing, it fails
+        closed and lets vLLM recompute.
+        """
+        self._ensure_heartbeat_started()
+
+        if request_id in self.retrieve_futures:
+            logger.info(
+                "Skipping CoherentKV CB V3 retrieve for %s because a normal "
+                "MP retrieve is already pending.",
+                request_id,
+            )
+            return False
+
+        if not self._coherentkv_cb_rope_registered:
+            logger.info(
+                "Skipping CoherentKV CB V3 retrieve for %s: CB RoPE state is not registered",
+                request_id,
+            )
+            return False
+
+        cb_matches, errors = _coherentkv_span_loads_to_cb_matches(
+            span_loads,
+            CBMatchResult,
+        )
+        if errors or not cb_matches:
+            logger.info(
+                "Skipping CoherentKV CB V3 retrieve for %s: %s",
+                request_id,
+                errors or ["no_cb_matches"],
+            )
+            return False
+
+        if not full_gpu_block_ids:
+            logger.info(
+                "Skipping CoherentKV CB V3 retrieve for %s: missing full block table",
+                request_id,
+            )
+            return False
+
+        aligned_end = (
+            len(token_ids) // self.lmcache_tokens_per_chunk
+        ) * self.lmcache_tokens_per_chunk
+        if aligned_end <= 0:
+            logger.info(
+                "Skipping CoherentKV CB V3 retrieve for %s: no chunk-aligned tokens",
+                request_id,
+            )
+            return False
+
+        if not self.is_healthy:
+            self.error_block_ids.update(full_gpu_block_ids)
+            self._dropped_retrieves.add(request_id)
+            return False
+
+        key = self._create_key(
+            token_ids,
+            start=0,
+            end=aligned_end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+        )
+        future = send_lmcache_request(
+            self.mq_client,
+            RequestType.CB_RETRIEVE_PRE_COMPUTED_V3,
+            [
+                key,
+                list(cb_matches),
+                list(full_gpu_block_ids),
+                self.instance_id,
+                event.ipc_handle(),
+            ],
+        ).to_cuda_future()
+        self.retrieve_futures[request_id] = (future, list(full_gpu_block_ids))
+        self.retrieve_events[request_id] = event
+        return True
 
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
@@ -1706,6 +2194,8 @@ class LMCacheMPWorkerAdapter:
         with self._heartbeat_lock:
             if self._heartbeat is not None:
                 self._heartbeat.stop()
+
+        self.unregister_cb_rope_v3_state(clear_saved_state=True)
 
         logger.info("Unregistering kv caches")
         try:

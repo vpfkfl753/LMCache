@@ -3,6 +3,9 @@
 from typing import Optional, Union
 import abc
 
+# First Party
+from lmcache.v1.span_lookup import SpanLookupResult
+
 # Third Party
 import torch
 
@@ -52,6 +55,28 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             None indicates the lookup/prefetch is in progress.
         """
         raise NotImplementedError
+
+
+    def lookup_spans(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        lookup_id: str,
+        request_configs: Optional[dict] = None,
+    ) -> Optional[SpanLookupResult]:
+        """Perform span-aware lookup when the client supports it.
+
+        The default keeps existing clients backward compatible by wrapping the
+        prefix-only integer lookup result.
+        """
+
+        prefix_tokens = self.lookup(
+            token_ids,
+            lookup_id=lookup_id,
+            request_configs=request_configs,
+        )
+        if prefix_tokens is None:
+            return None
+        return SpanLookupResult.from_prefix_tokens(prefix_tokens)
 
     @abc.abstractmethod
     def close(self) -> None:

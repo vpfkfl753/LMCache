@@ -41,12 +41,71 @@ from collections.abc import Mapping
 from typing import TypeAlias
 
 # Third Party
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    KVCacheSpec,
-    KVCacheSpecKind,
-    get_kv_cache_spec_kind,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+
+try:
+    # Newer vLLM exposes a stable enum/helper for cache-spec classification.
+    from vllm.v1.kv_cache_interface import (
+        KVCacheSpecKind,
+        get_kv_cache_spec_kind,
+    )
+except ImportError:
+    # vLLM 0.18.0 exposes the concrete spec classes but not the enum/helper.
+    # Keep the fallback local to the vLLM integration and classify by class
+    # name only when the class exists in the imported vLLM build.
+    import enum
+
+    from vllm.v1 import kv_cache_interface as _vllm_kv_iface
+
+    class KVCacheSpecKind(str, enum.Enum):
+        FULL_ATTENTION = "full_attention"
+        MLA_ATTENTION = "mla_attention"
+        SLIDING_WINDOW = "sliding_window"
+        SLIDING_WINDOW_MLA = "sliding_window_mla"
+        MAMBA = "mamba"
+        CHUNKED_LOCAL_ATTENTION = "chunked_local_attention"
+        SINK_FULL_ATTENTION = "sink_full_attention"
+        ENCODER_ONLY_ATTENTION = "encoder_only_attention"
+        CROSS_ATTENTION = "cross_attention"
+        UNKNOWN = "unknown"
+
+    def _coherentkv_spec_class(name: str) -> type | None:
+        cls = getattr(_vllm_kv_iface, name, None)
+        return cls if isinstance(cls, type) else None
+
+    def _coherentkv_is_spec(spec: KVCacheSpec, name: str) -> bool:
+        cls = _coherentkv_spec_class(name)
+        return cls is not None and isinstance(spec, cls)
+
+    def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
+        if _coherentkv_is_spec(kv_cache_spec, "UniformTypeKVCacheSpecs"):
+            inner = getattr(kv_cache_spec, "kv_cache_specs", {})
+            if isinstance(inner, dict):
+                inner_kinds = {
+                    get_kv_cache_spec_kind(spec) for spec in inner.values()
+                }
+                if len(inner_kinds) == 1:
+                    return next(iter(inner_kinds))
+            return KVCacheSpecKind.UNKNOWN
+        if _coherentkv_is_spec(kv_cache_spec, "SlidingWindowMLASpec"):
+            return KVCacheSpecKind.SLIDING_WINDOW_MLA
+        if _coherentkv_is_spec(kv_cache_spec, "MLAAttentionSpec"):
+            return KVCacheSpecKind.MLA_ATTENTION
+        if _coherentkv_is_spec(kv_cache_spec, "SinkFullAttentionSpec"):
+            return KVCacheSpecKind.SINK_FULL_ATTENTION
+        if _coherentkv_is_spec(kv_cache_spec, "FullAttentionSpec"):
+            return KVCacheSpecKind.FULL_ATTENTION
+        if _coherentkv_is_spec(kv_cache_spec, "ChunkedLocalAttentionSpec"):
+            return KVCacheSpecKind.CHUNKED_LOCAL_ATTENTION
+        if _coherentkv_is_spec(kv_cache_spec, "SlidingWindowSpec"):
+            return KVCacheSpecKind.SLIDING_WINDOW
+        if _coherentkv_is_spec(kv_cache_spec, "MambaSpec"):
+            return KVCacheSpecKind.MAMBA
+        if _coherentkv_is_spec(kv_cache_spec, "EncoderOnlyAttentionSpec"):
+            return KVCacheSpecKind.ENCODER_ONLY_ATTENTION
+        if _coherentkv_is_spec(kv_cache_spec, "CrossAttentionSpec"):
+            return KVCacheSpecKind.CROSS_ATTENTION
+        return KVCacheSpecKind.UNKNOWN
 import torch
 
 # First Party

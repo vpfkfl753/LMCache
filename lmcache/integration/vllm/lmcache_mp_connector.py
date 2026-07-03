@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 import enum
 import math
@@ -15,6 +15,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorLoadPlan,
+        KVConnectorSpanMatch,
+    )
+except ImportError:
+    KVConnectorLoadPlan = None
+    KVConnectorSpanMatch = None
 
 try:
     # Third Party
@@ -47,8 +55,13 @@ from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
-from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.utils import _lmcache_nvtx_annotate, init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
+from lmcache.v1.coherent_admission import (
+    SpanAdmissionCandidate,
+    build_span_admission_plan,
+    validate_span_admission_plan,
+)
 
 try:
     # First Party
@@ -175,6 +188,410 @@ class LMCacheMPRequestState(enum.Enum):
     WAITING_FOR_LOAD = enum.auto()
     READY = enum.auto()
 
+COHERENTKV_ENABLED_KEY = "lmcache.coherentkv.enabled"
+COHERENTKV_REQUEST_SNAPSHOT_KEY = "lmcache.coherentkv.request_snapshot"
+COHERENTKV_SPAN_DEPS_KEY = "lmcache.coherentkv.span_deps"
+COHERENTKV_SPAN_COMMITTED_KEY = "lmcache.coherentkv.span_committed"
+COHERENTKV_SPAN_COMPATIBLE_KEY = "lmcache.coherentkv.span_compatible"
+COHERENTKV_SPAN_PUBLISH_PROOFS_KEY = "lmcache.coherentkv.span_publish_proofs"
+
+
+def _coherentkv_extract_request_configs(request: Any) -> dict[str, Any] | None:
+    sampling_params = getattr(request, "sampling_params", None)
+    extra_args = getattr(sampling_params, "extra_args", None)
+    request_configs = None
+    if extra_args is not None:
+        if kv_transfer_params := extra_args.get("kv_transfer_params"):
+            for key, value in kv_transfer_params.items():
+                if str(key).startswith("lmcache."):
+                    if request_configs is None:
+                        request_configs = {}
+                    request_configs[str(key)] = value
+    return request_configs
+
+
+def _coherentkv_enabled(request_configs: dict[str, Any] | None) -> bool:
+    return bool((request_configs or {}).get(COHERENTKV_ENABLED_KEY, False))
+
+
+def _coerce_str_mapping(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def _coherentkv_span_key(start: int, end: int, key_index: Any) -> list[str]:
+    keys = [f"{start}:{end}"]
+    if key_index is not None:
+        keys.append(str(key_index))
+    return keys
+
+
+def _lookup_span_metadata(
+    mapping: Any,
+    start: int,
+    end: int,
+    key_index: Any,
+    default: Any,
+) -> Any:
+    if not isinstance(mapping, dict):
+        return default
+    for key in _coherentkv_span_key(start, end, key_index):
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
+def _build_coherentkv_mp_admission_plan(span_result: Any, request_configs: dict[str, Any]) -> Any:
+    request_snapshot = _coerce_str_mapping(
+        request_configs.get(COHERENTKV_REQUEST_SNAPSHOT_KEY)
+    )
+    deps_by_span = request_configs.get(COHERENTKV_SPAN_DEPS_KEY, {})
+    committed_by_span = request_configs.get(COHERENTKV_SPAN_COMMITTED_KEY, {})
+    compatible_by_span = request_configs.get(COHERENTKV_SPAN_COMPATIBLE_KEY, {})
+    publish_proofs_by_span = request_configs.get(COHERENTKV_SPAN_PUBLISH_PROOFS_KEY, {})
+
+    candidates: list[SpanAdmissionCandidate] = []
+    for span in getattr(span_result, "spans", ()):
+        if not getattr(span, "hit", False):
+            continue
+        span_metadata = _coerce_str_mapping(getattr(span, "metadata", {}))
+        publish_proof_metadata = _coerce_str_mapping(
+            _lookup_span_metadata(
+                publish_proofs_by_span,
+                span.start,
+                span.end,
+                span.key_index,
+                {},
+            )
+        )
+        cached_deps = _coerce_str_mapping(
+            _lookup_span_metadata(
+                deps_by_span,
+                span.start,
+                span.end,
+                span.key_index,
+                {},
+            )
+        )
+        has_declared_deps = bool(cached_deps)
+        committed = bool(
+            _lookup_span_metadata(
+                committed_by_span,
+                span.start,
+                span.end,
+                span.key_index,
+                False,
+            )
+        )
+        compatible = bool(
+            _lookup_span_metadata(
+                compatible_by_span,
+                span.start,
+                span.end,
+                span.key_index,
+                False,
+            )
+        )
+        candidates.append(
+            SpanAdmissionCandidate(
+                name=f"mp-span:{span.start}:{span.end}",
+                start_token=int(span.start),
+                end_token=int(span.end),
+                committed=committed and has_declared_deps,
+                compatible=compatible,
+                cached_deps=cached_deps,
+                metadata={
+                    **span_metadata,
+                    **publish_proof_metadata,
+                    "key_index": "" if span.key_index is None else str(span.key_index),
+                    "missing_declared_deps": str(not has_declared_deps).lower(),
+                    "coherentkv_mp_cb_unified_lookup": "true",
+                },
+            )
+        )
+
+    return build_span_admission_plan(
+        candidates=candidates,
+        request_snapshot=request_snapshot,
+        total_context_tokens=max(
+            [span.end for span in getattr(span_result, "spans", ())]
+            + [getattr(span_result, "prefix_hit_tokens", 0)]
+        ),
+    )
+
+
+def _coherentkv_admitted_prefix_tokens(plan: Any) -> int:
+    prefix = 0
+    admitted = sorted(
+        [decision.candidate for decision in plan.decisions if decision.admitted],
+        key=lambda candidate: (candidate.start_token, candidate.end_token),
+    )
+    for candidate in admitted:
+        if candidate.start_token != prefix:
+            break
+        prefix = candidate.end_token
+    return prefix
+
+
+def _coherentkv_mp_admitted_nonprefix_span_matches(
+    plan: Any,
+    prefix_frontier: int,
+) -> tuple[Any, ...]:
+    if KVConnectorSpanMatch is None:
+        return ()
+    try:
+        validation_errors = validate_span_admission_plan(plan)
+    except Exception:
+        return ()
+    if validation_errors:
+        return ()
+    span_matches = []
+    admitted = sorted(
+        [decision.candidate for decision in plan.decisions if decision.admitted],
+        key=lambda candidate: (candidate.start_token, candidate.end_token),
+    )
+    for candidate in admitted:
+        if candidate.end_token <= prefix_frontier:
+            continue
+        if candidate.start_token < prefix_frontier:
+            continue
+        metadata = dict(candidate.metadata or {})
+        if not metadata.get("coherentkv_cb_hash_hex"):
+            continue
+        metadata["coherentkv_admitted"] = "true"
+        span_matches.append(
+            KVConnectorSpanMatch(
+                start_token=candidate.start_token,
+                end_token=candidate.end_token,
+                source="lmcache_cb_unified",
+                metadata=metadata,
+            )
+        )
+    return tuple(span_matches)
+
+
+_COHERENTKV_PUBLISH_TRUE_STRINGS = {"1", "true", "yes", "y", "ok", "pass", "validated"}
+_COHERENTKV_INVALID_RECOMPUTE_GAP_REASONS = {
+    "invalid_total_token_count",
+    "invalid_or_overlapping_span",
+    "span_beyond_request",
+}
+
+
+def _coherentkv_publish_metadata_truthy(metadata: Any, *keys: str) -> bool:
+    if not hasattr(metadata, "get"):
+        return False
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        if isinstance(value, (int, float)):
+            if bool(value):
+                return True
+            continue
+        if value is not None and str(value).strip().lower() in _COHERENTKV_PUBLISH_TRUE_STRINGS:
+            return True
+    return False
+
+
+def _coherentkv_recompute_gaps_are_publish_valid(recompute_gaps: Any) -> bool:
+    for gap in recompute_gaps or ():
+        reason = str(getattr(gap, "reason", "")).strip().lower()
+        if reason.startswith("invalid") or reason in _COHERENTKV_INVALID_RECOMPUTE_GAP_REASONS:
+            return False
+        try:
+            start = int(getattr(gap, "start_token"))
+            end = int(getattr(gap, "end_token"))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if end < start:
+            return False
+    return True
+
+
+def _coherentkv_has_destination_blocks(span_load: Any) -> bool:
+    by_group = getattr(span_load, "destination_block_ids_by_group", ())
+    flat = getattr(span_load, "destination_block_ids", ())
+    return bool(by_group or flat)
+
+
+def _coherentkv_has_parity_publish_proof(metadata: Any) -> bool:
+    if not _coherentkv_publish_metadata_truthy(metadata, "coherentkv_parity_validated"):
+        return False
+    return bool(
+        metadata.get("coherentkv_parity_artifact_id")
+        or metadata.get("coherentkv_parity_artifact")
+    )
+
+
+def _coherentkv_copy_span_load_with_metadata(span_load: Any, metadata: dict[str, str]) -> Any:
+    try:
+        return replace(span_load, metadata=metadata)
+    except Exception:
+        try:
+            span_load.metadata = metadata
+            return span_load
+        except Exception:
+            return span_load
+
+
+def _coherentkv_publish_proof_span_loads(
+    span_loads: Any,
+    span_load_plan: Any,
+    total_token_count: int | None,
+) -> tuple[Any, ...]:
+    """Return only spans with admission, gap, parity, and artifact proofs.
+
+    Gap proof is not trusted from request metadata. It is stamped here only
+    after the vLLM load plan computes a valid recompute complement for the
+    current request token count. Parity proof is external: it must already be
+    present as metadata from a parity artifact, and missing parity keeps the span
+    on the recompute path.
+    """
+
+    if total_token_count is None or not hasattr(span_load_plan, "to_recompute_gaps"):
+        return ()
+    try:
+        recompute_gaps = span_load_plan.to_recompute_gaps(total_token_count)
+    except Exception:
+        return ()
+    if not _coherentkv_recompute_gaps_are_publish_valid(recompute_gaps):
+        return ()
+
+    proofed: list[Any] = []
+    for span_load in _coherentkv_loadable_span_loads(span_loads):
+        metadata = dict(getattr(span_load, "metadata", None) or {})
+        if not _coherentkv_has_destination_blocks(span_load):
+            continue
+        if not (metadata.get("coherentkv_cb_hash_hex") or metadata.get("cb_hash_hex")):
+            continue
+        if not _coherentkv_publish_metadata_truthy(metadata, "coherentkv_admitted"):
+            continue
+        if not _coherentkv_has_parity_publish_proof(metadata):
+            continue
+        metadata.update(
+            {
+                "coherentkv_gap_validated": "true",
+                "coherentkv_recompute_gap_validated": "true",
+                "coherentkv_recompute_gap_count": str(len(tuple(recompute_gaps or ()))),
+                "coherentkv_total_token_count": str(int(total_token_count)),
+                "coherentkv_publish_proof_bridge": "true",
+            }
+        )
+        proofed.append(_coherentkv_copy_span_load_with_metadata(span_load, metadata))
+    return tuple(proofed)
+
+
+_COHERENTKV_UNSUPPORTED_ROPE_CLASS_MARKERS = (
+    "MRotary",
+    "XDRotary",
+    "DualChunk",
+    "Fourier",
+    "Phi3Long",
+    "Gemma4",
+    "Llama4Vision",
+    "Ernie",
+)
+
+
+def _coherentkv_iter_rope_objects(model: Any) -> list[Any]:
+    if model is None:
+        return []
+    modules = model.modules() if hasattr(model, "modules") else ()
+    rope_objects = []
+    seen: set[int] = set()
+    for module in modules:
+        candidates = []
+        rotary_emb = getattr(module, "rotary_emb", None)
+        if rotary_emb is not None:
+            candidates.append(rotary_emb)
+        if hasattr(module, "cos_sin_cache") and hasattr(module, "head_size"):
+            candidates.append(module)
+        for rope in candidates:
+            ident = id(rope)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            rope_objects.append(rope)
+    return rope_objects
+
+
+def _coherentkv_extract_uniform_rope_state_from_model(
+    model: Any,
+) -> tuple[torch.Tensor | None, int, bool, list[str]]:
+    """Extract one uniform standard RoPE state from a loaded vLLM model.
+
+    Returns ``(cos_sin_cache, head_size, is_neox_style, errors)``. Any error
+    means the caller must fail closed and skip Blend V3 shifted-span retrieval.
+    """
+
+    rope_objects = _coherentkv_iter_rope_objects(model)
+    if not rope_objects:
+        return None, 0, True, ["missing_rope_object"]
+
+    candidates: list[tuple[torch.Tensor, int, bool, tuple[Any, ...]]] = []
+    errors: list[str] = []
+    for index, rope in enumerate(rope_objects):
+        class_name = type(rope).__name__
+        if any(marker in class_name for marker in _COHERENTKV_UNSUPPORTED_ROPE_CLASS_MARKERS):
+            errors.append(f"rope_{index}:unsupported_class:{class_name}")
+            continue
+        cos_sin_cache = getattr(rope, "cos_sin_cache", None)
+        if not torch.is_tensor(cos_sin_cache):
+            errors.append(f"rope_{index}:missing_cos_sin_cache")
+            continue
+        try:
+            head_size = int(getattr(rope, "head_size"))
+        except (TypeError, ValueError):
+            errors.append(f"rope_{index}:invalid_head_size")
+            continue
+        rotary_dim = getattr(rope, "rotary_dim", head_size)
+        try:
+            rotary_dim = int(rotary_dim)
+        except (TypeError, ValueError):
+            errors.append(f"rope_{index}:invalid_rotary_dim")
+            continue
+        if head_size <= 0 or rotary_dim != head_size:
+            errors.append(f"rope_{index}:unsupported_rotary_dim")
+            continue
+        is_neox_style = bool(getattr(rope, "is_neox_style", True))
+        if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != head_size:
+            errors.append(f"rope_{index}:unexpected_cos_sin_shape")
+            continue
+        signature = (
+            head_size,
+            is_neox_style,
+            tuple(cos_sin_cache.shape),
+            str(cos_sin_cache.dtype),
+            str(cos_sin_cache.device),
+        )
+        candidates.append((cos_sin_cache, head_size, is_neox_style, signature))
+
+    if errors:
+        return None, 0, True, errors
+    if not candidates:
+        return None, 0, True, ["no_supported_rope_state"]
+
+    signatures = {candidate[3] for candidate in candidates}
+    if len(signatures) != 1:
+        return None, 0, True, ["multiple_inconsistent_rope_states"]
+
+    cos_sin_cache, head_size, is_neox_style, _signature = candidates[0]
+    return cos_sin_cache, head_size, is_neox_style, []
+
+
+def _coherentkv_loadable_span_loads(span_loads: Any) -> tuple[Any, ...]:
+    loadable = []
+    for span_load in span_loads or ():
+        by_group = getattr(span_load, "destination_block_ids_by_group", ())
+        flat = getattr(span_load, "destination_block_ids", ())
+        if by_group or flat:
+            loadable.append(span_load)
+    return tuple(loadable)
+
 
 @dataclass
 class LMCacheMPRequestTracker:
@@ -293,6 +710,8 @@ class LMCacheMPRequestMetadata:
     direction: Literal["STORE", "RETRIEVE"]
     op: LoadStoreOp
     cache_salt: str = ""
+    coherentkv_span_loads: tuple[Any, ...] = field(default_factory=tuple)
+    coherentkv_full_block_ids: list[int] = field(default_factory=list)
 
     @staticmethod
     def GetStoreMetadata(
@@ -594,6 +1013,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            self.coherentkv_span_loads: dict[str, tuple[Any, ...]] = {}
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -611,6 +1031,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
+            self.coherentkv_span_only_retrieve_ids: set[str] = set()
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
@@ -698,6 +1119,65 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return
 
+    def register_cb_rope_state_from_model(self, model: Any) -> bool:
+        """Extract and register a supported uniform RoPE state from vLLM.
+
+        This method is intentionally fail-closed. It only supports standard
+        uniform text RoPE where all discovered RoPE objects share the same
+        cos/sin-cache metadata and ``rotary_dim == head_size``.
+        """
+        if not hasattr(self, "worker_adapter"):
+            logger.info(
+                "CoherentKV CB RoPE model registration is worker-side only; "
+                "no worker_adapter is present"
+            )
+            return False
+        if mla_enabled(self._vllm_config.model_config):
+            logger.info("Skipping CoherentKV CB RoPE model registration: MLA is unsupported")
+            return False
+        cos_sin_cache, head_size, is_neox_style, errors = (
+            _coherentkv_extract_uniform_rope_state_from_model(model)
+        )
+        if errors or cos_sin_cache is None:
+            logger.info(
+                "Skipping CoherentKV CB RoPE model registration: %s",
+                errors or ["missing_cos_sin_cache"],
+            )
+            return False
+        return self.register_cb_rope_v3_state(
+            cos_sin_cache,
+            head_size,
+            is_neox_style,
+        )
+
+    def register_cb_rope_v3_state(
+        self,
+        cos_sin_cache: torch.Tensor,
+        head_size: int,
+        is_neox_style: bool,
+    ) -> bool:
+        """Delegate Blend V3 RoPE registration to the worker adapter.
+
+        This is a callable surface for a later vLLM model-runner hook. It does
+        not automatically discover or register RoPE caches by itself.
+        """
+        if not hasattr(self, "worker_adapter"):
+            logger.info(
+                "CoherentKV CB RoPE registration is worker-side only; "
+                "no worker_adapter is present"
+            )
+            return False
+        return self.worker_adapter.register_cb_rope_v3_state(
+            cos_sin_cache,
+            head_size,
+            is_neox_style,
+        )
+
+    def unregister_cb_rope_v3_state(self) -> bool:
+        if not hasattr(self, "worker_adapter"):
+            return True
+        return self.worker_adapter.unregister_cb_rope_v3_state()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
@@ -719,24 +1199,49 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         request_ids = []
         ops = []
         cache_salts = []
+        cb_retrieve_metas = []
 
         for meta in metadata.requests:
             if meta.direction != "RETRIEVE":
                 continue
-            request_ids.append(meta.request_id)
-            ops.append(meta.op)
-            cache_salts.append(meta.cache_salt)
+            if meta.op.end > meta.op.start and bool(meta.op.flat_block_ids):
+                request_ids.append(meta.request_id)
+                ops.append(meta.op)
+                cache_salts.append(meta.cache_salt)
+            if meta.coherentkv_span_loads:
+                cb_retrieve_metas.append(meta)
 
-        if len(request_ids) == 0:
+        if len(request_ids) == 0 and len(cb_retrieve_metas) == 0:
             return
 
         with torch_dev.stream(torch_dev.current_stream()):
             event = torch_dev.Event(interprocess=True)
             event.record()
 
-        self.worker_adapter.batched_submit_retrieve_requests(
-            request_ids, ops, event, cache_salts=cache_salts
-        )
+        if request_ids:
+            self.worker_adapter.batched_submit_retrieve_requests(
+                request_ids, ops, event, cache_salts=cache_salts
+            )
+
+        normal_retrieve_ids = set(request_ids)
+        for meta in cb_retrieve_metas:
+            if meta.request_id in normal_retrieve_ids:
+                logger.info(
+                    "Skipping CoherentKV CB V3 retrieve for %s because normal "
+                    "MP retrieve is already scheduled in this step.",
+                    meta.request_id,
+                )
+                continue
+            token_ids = list(meta.op.token_ids or ())
+            self.coherentkv_span_only_retrieve_ids.add(meta.request_id)
+            self.worker_adapter.submit_cb_retrieve_pre_computed_v3_request(
+                meta.request_id,
+                token_ids,
+                meta.coherentkv_span_loads,
+                meta.coherentkv_full_block_ids,
+                event,
+                cache_salt=meta.cache_salt,
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -825,9 +1330,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
-        val = self.worker_adapter.get_finished(finished_req_ids)
-        # logger.error("Finished req ids: %s, %s", val[0], val[1])
-        return val
+        finished_sending, finished_recving = self.worker_adapter.get_finished(
+            finished_req_ids
+        )
+        if finished_recving and hasattr(self, "coherentkv_span_only_retrieve_ids"):
+            span_only_done = set(finished_recving) & self.coherentkv_span_only_retrieve_ids
+            if span_only_done:
+                self.coherentkv_span_only_retrieve_ids.difference_update(span_only_done)
+                filtered_recving = set(finished_recving) - span_only_done
+                logger.info(
+                    "CoherentKV filtered %d span-only retrieve completions from "
+                    "scheduler remote-KV bookkeeping.",
+                    len(span_only_done),
+                )
+                finished_recving = filtered_recving or None
+        # logger.error("Finished req ids: %s, %s", finished_sending, finished_recving)
+        return finished_sending, finished_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -870,6 +1388,91 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    @_lmcache_nvtx_annotate
+    def get_span_load_plan(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> Any:
+        """Expose MP CB_UNIFIED_LOOKUP span metadata when vLLM can carry it.
+
+        The existing prefix lookup path remains authoritative for scheduling.
+        Unified lookup is used only to attach Blend V3 span/hash metadata after
+        CoherentKV admission. Non-prefix spans are metadata-only until a later
+        worker patch retrieves them and a parity gate authorizes publication.
+        """
+
+        num_external_hit_tokens, load_kv_async = self.get_num_new_matched_tokens(
+            request,
+            num_computed_tokens,
+        )
+        if KVConnectorLoadPlan is None:
+            return num_external_hit_tokens, load_kv_async
+        if num_external_hit_tokens is None:
+            return KVConnectorLoadPlan(
+                contiguous_prefix_tokens=None,
+                load_kv_async=load_kv_async,
+            )
+
+        metadata = {"coherentkv_mp_cb_unified_lookup": "unavailable"}
+        nonprefix_spans = ()
+        if hasattr(self.scheduler_adapter, "maybe_submit_cb_unified_lookup_request"):
+            tracker = self._get_or_create_request_tracker(request)
+            self.scheduler_adapter.maybe_submit_cb_unified_lookup_request(
+                request.request_id,
+                token_ids=list(request.all_token_ids),
+                cache_salt=tracker.cache_salt,
+            )
+            span_result = self.scheduler_adapter.check_cb_unified_lookup_result(
+                request.request_id
+            )
+            if span_result is None:
+                metadata = {"coherentkv_mp_cb_unified_lookup": "pending"}
+            else:
+                metadata = {
+                    "coherentkv_mp_cb_unified_lookup": "complete",
+                    "span_count": str(len(span_result.spans)),
+                    "nonprefix_hit_tokens": str(span_result.nonprefix_hit_tokens),
+                }
+                request_configs = _coherentkv_extract_request_configs(request)
+                if _coherentkv_enabled(request_configs):
+                    plan = _build_coherentkv_mp_admission_plan(
+                        span_result,
+                        request_configs or {},
+                    )
+                    validation_errors = validate_span_admission_plan(plan)
+                    if validation_errors:
+                        metadata = {
+                            **metadata,
+                            "coherentkv_mp_admission": "validation_failed",
+                        }
+                    else:
+                        prefix_frontier = max(
+                            int(num_external_hit_tokens or 0),
+                            _coherentkv_admitted_prefix_tokens(plan),
+                        )
+                        nonprefix_spans = _coherentkv_mp_admitted_nonprefix_span_matches(
+                            plan,
+                            prefix_frontier,
+                        )
+                        metadata = {
+                            **metadata,
+                            "coherentkv_mp_admission": "validated",
+                            "nonprefix_span_count": str(len(nonprefix_spans)),
+                        }
+                else:
+                    metadata = {
+                        **metadata,
+                        "coherentkv_mp_admission": "disabled_fail_closed",
+                    }
+
+        return KVConnectorLoadPlan(
+            contiguous_prefix_tokens=num_external_hit_tokens,
+            load_kv_async=load_kv_async,
+            nonprefix_spans=nonprefix_spans,
+            metadata=metadata,
+        )
 
     def get_num_new_matched_tokens(
         self,
@@ -943,6 +1546,54 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return need_to_load, need_to_load > 0
 
+    def update_span_load_metadata_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        span_load_plan: Any,
+        block_size: int,
+        total_token_count: int | None = None,
+    ) -> None:
+        """Record loadable span metadata after scheduler allocation.
+
+        The worker side still submits CB V3 only when all safety prerequisites
+        are present. This method only retains destination-aware span-load
+        records produced by vLLM's span metadata contract.
+        """
+
+        if KVConnectorLoadPlan is None or not isinstance(
+            span_load_plan,
+            KVConnectorLoadPlan,
+        ):
+            return
+        try:
+            span_loads = span_load_plan.to_span_loads(
+                request.request_id,
+                blocks=blocks,
+                block_size=block_size,
+            )
+        except TypeError:
+            span_loads = span_load_plan.to_span_loads(request.request_id)
+        logger.info(
+            "CoherentKV span metadata lowering for %s produced %d span loads",
+            request.request_id,
+            len(tuple(span_loads or ())),
+        )
+        proofed_loads = _coherentkv_publish_proof_span_loads(
+            span_loads,
+            span_load_plan,
+            total_token_count,
+        )
+        logger.info(
+            "CoherentKV span metadata proof filter for %s kept %d span loads",
+            request.request_id,
+            len(tuple(proofed_loads or ())),
+        )
+        if proofed_loads:
+            self.coherentkv_span_loads[request.request_id] = proofed_loads
+        else:
+            self.coherentkv_span_loads.pop(request.request_id, None)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -993,6 +1644,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             # Clean up lookup future in scheduler adapter
             self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+            if hasattr(self.scheduler_adapter, "cleanup_cb_unified_lookup_result"):
+                self.scheduler_adapter.cleanup_cb_unified_lookup_result(request.request_id)
 
             # Free locks on chunks that vLLM already computed and won't
             # retrieve from LMCache.
@@ -1193,7 +1846,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 lmcache_tokens_per_chunk,
                 group_tokens_per_block=self._group_tokens_per_block,
             )
+            span_loads = self.coherentkv_span_loads.pop(
+                request_tracker.request_id,
+                (),
+            )
             if r_metadata is not None:
+                r_metadata.coherentkv_span_loads = span_loads
+                r_metadata.coherentkv_full_block_ids = list(
+                    request_tracker.allocated_block_ids.get(0, ())
+                )
                 metadata.add_request_metadata(r_metadata)
             request_tracker.state = LMCacheMPRequestState.READY
 
@@ -1217,6 +1878,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_meta is not None:
                 metadata.add_request_metadata(r_meta)
+            span_loads = self.coherentkv_span_loads.pop(new_request.req_id, ())
+            if span_loads:
+                span_meta = LMCacheMPRequestMetadata(
+                    request_id=request_tracker.request_id,
+                    direction="RETRIEVE",
+                    op=LoadStoreOp(
+                        token_ids=list(request_tracker.all_token_ids),
+                        block_ids=[],
+                        start=0,
+                        end=0,
+                    ),
+                    cache_salt=request_tracker.cache_salt,
+                )
+                span_meta.coherentkv_span_loads = span_loads
+                span_meta.coherentkv_full_block_ids = list(
+                    request_tracker.allocated_block_ids.get(0, ())
+                )
+                metadata.add_request_metadata(span_meta)
+                logger.info(
+                    "CoherentKV scheduling %d non-prefix span loads for %s "
+                    "without a prefix retrieve op.",
+                    len(span_loads),
+                    request_tracker.request_id,
+                )
 
     def _process_cached_requests(
         self,
@@ -1347,6 +2032,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         This should be called when a request is finished to prevent memory leak.
         """
         # Clean up request tracker
+        self.coherentkv_span_loads.pop(request_id, None)
         if self.request_trackers.pop(request_id, None):
             logger.debug(
                 "[KVConnector] Cleaned up request_tracker for request %s",

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from queue import Empty as QueueEmpty
 from queue import Queue
 from typing import TYPE_CHECKING, Any
+import os
 import threading
 import time
 
@@ -546,12 +547,27 @@ class BlendV3Module(InstanceLivenessTarget):
             except QueueEmpty:
                 break
             tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
+            logger.info(
+                "COHERENTKV sync fingerprint drain tokens=%d hashes=%d start_chunk=%d offset=%d",
+                len(tokens_in_range),
+                len(chunk_hashes),
+                start_chunk_idx,
+                position_offset,
+            )
             try:
                 self._token_range_matcher.on_new_token_hashes(
                     tokens_in_range,
                     chunk_hashes,
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
+                )
+                logger.info(
+                    "COHERENTKV fingerprint matcher registered_chunks=%d",
+                    len(self._token_range_matcher._chunk_token_hash),
+                )
+                logger.info(
+                    "COHERENTKV fingerprint matcher registered_chunks=%d",
+                    len(self._token_range_matcher._chunk_token_hash),
                 )
             except Exception:
                 logger.exception("CB fingerprint registration failed (sync drain)")
@@ -893,6 +909,14 @@ class BlendV3Module(InstanceLivenessTarget):
         """
         rid = key.request_id
         chunk_size = self._ctx.chunk_size
+        logger.info(
+            "COHERENTKV CB_UNIFIED_LOOKUP request=%s tokens=%d model=%s ws=%d sample71=%s",
+            rid,
+            len(key.token_ids),
+            key.model_name,
+            key.world_size,
+            list(key.token_ids)[71:79],
+        )
 
         with self._cb_jobs_lock:
             job = self._cb_jobs.get(rid)
@@ -939,6 +963,10 @@ class BlendV3Module(InstanceLivenessTarget):
                     )
                 )
                 matches = self._match_fingerprints(key)
+                logger.info(
+                    "COHERENTKV CB_UNIFIED_LOOKUP fingerprint matches=%d",
+                    len(matches),
+                )
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.CB_FINGERPRINT_MATCH_END,
@@ -1157,6 +1185,14 @@ class BlendV3Module(InstanceLivenessTarget):
             tuple[bytes, bool]: The underlying ``LMCacheDrivenTransfer.store`` result
             (event handle, success).
         """
+        logger.info(
+            "COHERENTKV BlendV3 store wrapper request=%s start=%d end=%d worker=%s sample128=%s",
+            key.request_id,
+            key.start,
+            key.end,
+            key.worker_id,
+            list(key.token_ids)[128:136],
+        )
         result = self._transfer_module.store(
             key, instance_id, gpu_block_ids, event_ipc_handle
         )
@@ -1174,6 +1210,20 @@ class BlendV3Module(InstanceLivenessTarget):
                 TokenHasher.hash_to_bytes(h)
                 for h in session.get_hashes(key.start, key.end)
             ]
+            if (
+                os.getenv("COHERENTKV_EAGER_CB_FP_REGISTER") == "1"
+                or not chunk_hashes
+            ):
+                chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                    list(key.token_ids),
+                    start=key.start,
+                    end=key.end,
+                )
+            logger.info(
+                "COHERENTKV BlendV3 store fingerprint hashes=%d eager=%s",
+                len(chunk_hashes),
+                os.getenv("COHERENTKV_EAGER_CB_FP_REGISTER"),
+            )
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
@@ -1183,7 +1233,22 @@ class BlendV3Module(InstanceLivenessTarget):
                 self._pending_fp_hashes.update(chunk_hashes[start_chunk_idx:])
             entry = self._transfer_module.get_and_touch_context_entry(instance_id)
             gpu_ctx = entry.cache_context if entry is not None else None
-            if gpu_ctx is not None and gpu_ctx.cupy_stream is not None:
+            if os.getenv("COHERENTKV_EAGER_CB_FP_REGISTER") == "1":
+                self._token_range_matcher.on_new_token_hashes(
+                    tokens_in_range,
+                    chunk_hashes,
+                    start_chunk_idx=start_chunk_idx,
+                    position_offset=key.start,
+                )
+                logger.info(
+                    "COHERENTKV eager matcher registered_chunks=%d",
+                    len(self._token_range_matcher._chunk_token_hash),
+                )
+                with self._pending_fp_lock:
+                    self._pending_fp_hashes.difference_update(
+                        chunk_hashes[start_chunk_idx:]
+                    )
+            elif gpu_ctx is not None and gpu_ctx.cupy_stream is not None:
                 gpu_ctx.cupy_stream.launch_host_func(
                     self._fingerprint_queue.put_nowait, job
                 )
@@ -1350,12 +1415,23 @@ class BlendV3Module(InstanceLivenessTarget):
             except QueueEmpty:
                 continue
             tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
+            logger.info(
+                "COHERENTKV async fingerprint drain tokens=%d hashes=%d start_chunk=%d offset=%d",
+                len(tokens_in_range),
+                len(chunk_hashes),
+                start_chunk_idx,
+                position_offset,
+            )
             try:
                 self._token_range_matcher.on_new_token_hashes(
                     tokens_in_range,
                     chunk_hashes,
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
+                )
+                logger.info(
+                    "COHERENTKV async matcher registered_chunks=%d",
+                    len(self._token_range_matcher._chunk_token_hash),
                 )
             except Exception:
                 logger.exception("CB fingerprint registration failed (async)")

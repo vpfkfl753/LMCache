@@ -556,6 +556,7 @@ class LMCacheConnectorV1Impl:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
+        self.span_lookup_results: dict[str, Any] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}
 
@@ -1413,11 +1414,22 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
-            )
+            if self.enable_blending and hasattr(self.lookup_client, "lookup_spans"):
+                span_result = self.lookup_client.lookup_spans(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
+                self.span_lookup_results[req_id] = span_result
+                num_external_hit_tokens = (
+                    None if span_result is None else span_result.prefix_hit_tokens
+                )
+            else:
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
 
         if num_external_hit_tokens is None:
             logger.debug(

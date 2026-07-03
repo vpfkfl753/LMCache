@@ -56,6 +56,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.span_lookup import SpanLookupHit, SpanLookupResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -1120,6 +1121,97 @@ class LMCacheEngine:
             )
 
         yield ret_mask
+
+
+    def lookup_spans(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        search_range: Optional[List[str]] = None,
+        lookup_id: Optional[str] = None,
+        pin: bool = False,
+        request_configs: Optional[dict] = None,
+    ) -> SpanLookupResult:
+        """Return per-segment lookup hits without collapsing to a prefix int.
+
+        This is the #3238-compatible discovery surface.  The old ``lookup``
+        method remains prefix-only and backward compatible.  Admission,
+        recompute-gap planning, and non-prefix retrieval are intentionally
+        left to the connector/scheduler layer.
+        """
+        if not self.is_healthy():
+            logger.warning("LMCache is unhealthy, skipping span lookup operation")
+            return SpanLookupResult(prefix_hit_tokens=0, spans=[])
+
+        assert self.storage_manager is not None
+
+        if search_range is None:
+            search_range = self.retrieve_locations
+
+        chunk_info_iterator = self.token_database.process_tokens(
+            tokens=tokens,
+            hashes=hashes,
+            offsets=offsets,
+            request_configs=request_configs,
+        )
+
+        spans: list[SpanLookupHit] = []
+        prefix_hit_tokens = 0
+        prefix_open = True
+        for idx, (start, end, key) in enumerate(chunk_info_iterator):
+            assert isinstance(key, CacheEngineKey)
+            backend_name: Optional[str] = None
+            hit = False
+
+            if self.use_layerwise:
+                key_all_layers = key.split_layers(self.num_layers)
+                hit_chunks, block_mapping = self.storage_manager.batched_contains(
+                    key_all_layers,
+                    search_range,
+                    pin,
+                )
+                hit = hit_chunks == self.num_layers and len(block_mapping) == 1
+                if hit:
+                    backend_name = next(iter(block_mapping.keys()))
+                    if pin:
+                        assert lookup_id is not None, (
+                            "lookup_id is required when pin is True"
+                        )
+                        self.lookup_pins[lookup_id][backend_name].extend(
+                            key_all_layers
+                        )
+            else:
+                backend_name = self.storage_manager.contains(
+                    key,
+                    search_range,
+                    pin,
+                )
+                hit = backend_name is not None
+                if hit and pin:
+                    assert lookup_id is not None, (
+                        "lookup_id is required when pin is True"
+                    )
+                    self.lookup_pins[lookup_id][backend_name].append(key)
+
+            if prefix_open and hit and start == prefix_hit_tokens:
+                prefix_hit_tokens = end
+            else:
+                prefix_open = False
+
+            spans.append(
+                SpanLookupHit(
+                    start=start,
+                    end=end,
+                    hit=hit,
+                    backend=backend_name,
+                    key_index=idx,
+                )
+            )
+
+        if pin:
+            self.storage_manager.touch_cache()
+        return SpanLookupResult(prefix_hit_tokens=prefix_hit_tokens, spans=spans)
 
     @_lmcache_nvtx_annotate
     def lookup(

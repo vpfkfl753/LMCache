@@ -13,6 +13,10 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.span_lookup import (
+    SpanLookupResult,
+    intersect_span_lookup_results,
+)
 from lmcache.v1.rpc.transport import (
     RpcClientTransport,
     RpcServerTransport,
@@ -60,6 +64,7 @@ class LMCacheLookupClient(LookupClientInterface):
         # looked up, the following lookups of the same
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
+        self.span_reqs_status: dict[str, SpanLookupResult] = {}
 
         # First Party
         from lmcache.v1.token_database import (
@@ -82,6 +87,48 @@ class LMCacheLookupClient(LookupClientInterface):
         int >= 0 means number of hit tokens
         """
         return self.reqs_status.get(lookup_id, -1)
+
+
+    def lookup_spans(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        lookup_id: str,
+        request_configs: Optional[dict] = None,
+    ) -> Optional[SpanLookupResult]:
+        """Lookup token spans and return non-prefix hit metadata."""
+        if lookup_id in self.span_reqs_status:
+            return self.span_reqs_status[lookup_id]
+
+        span_configs = dict(request_configs or {})
+        span_configs["lmcache.return_span_lookup"] = True
+        request_configs_str = json.dumps(span_configs)
+
+        if isinstance(token_ids, torch.Tensor):
+            serializable_ids = token_ids.tolist()
+        elif not isinstance(token_ids, list):
+            serializable_ids = list(token_ids)
+        else:
+            serializable_ids = token_ids
+
+        msg_buf = [
+            serializable_ids,
+            lookup_id,
+            request_configs_str,
+        ]
+        responses = self.transport.send_and_recv_all(msg_buf)
+        if not responses:
+            return SpanLookupResult(prefix_hit_tokens=0, spans=[])
+
+        results = [SpanLookupResult.from_bytes(resp) for resp in responses]
+        if len({result.prefix_hit_tokens for result in results}) > 1:
+            logger.warning(
+                "Span lookup prefix hit tokens differ across ranks: %s.",
+                [result.prefix_hit_tokens for result in results],
+            )
+        result = intersect_span_lookup_results(results)
+        self.span_reqs_status[lookup_id] = result
+        self.reqs_status[lookup_id] = result.prefix_hit_tokens
+        return result
 
     def lookup(
         self,
@@ -159,6 +206,7 @@ class LMCacheLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+        self.span_reqs_status.pop(lookup_id, None)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports
@@ -237,7 +285,22 @@ class LMCacheLookupServer:
                         json.loads(request_configs_str) if request_configs_str else None
                     )
 
-                    if not self.enable_blending:
+                    return_span_lookup = bool(
+                        request_configs
+                        and request_configs.get("lmcache.return_span_lookup")
+                    )
+                    key_request_configs = dict(request_configs or {})
+                    key_request_configs.pop("lmcache.return_span_lookup", None)
+                    if return_span_lookup:
+                        tokens = data_frames[0]
+                        span_result = self.lmcache_engine.lookup_spans(
+                            tokens=tokens,
+                            lookup_id=lookup_id,
+                            pin=True,
+                            request_configs=key_request_configs,
+                        )
+                        response = span_result.to_bytes()
+                    elif not self.enable_blending:
                         hashes = data_frames[0]
                         offsets = data_frames[1]
                         lookup_result = self.lmcache_engine.lookup(
@@ -245,17 +308,18 @@ class LMCacheLookupServer:
                             offsets=offsets,
                             lookup_id=lookup_id,
                             pin=True,
-                            request_configs=request_configs,
+                            request_configs=key_request_configs,
                         )
+                        response = lookup_result.to_bytes(4, "big")
                     else:
                         tokens = data_frames[0]
                         lookup_result = self.lmcache_engine.lookup(
                             tokens=tokens,
                             lookup_id=lookup_id,
                             pin=True,
-                            request_configs=request_configs,
+                            request_configs=key_request_configs,
                         )
-                    response = lookup_result.to_bytes(4, "big")
+                        response = lookup_result.to_bytes(4, "big")
                     self.transport.send_response(identity, response)
                 except json.JSONDecodeError as e:
                     logger.error("Error decoding JSON in lookup request: %s", e)
