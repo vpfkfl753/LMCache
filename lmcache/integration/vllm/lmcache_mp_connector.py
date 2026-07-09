@@ -519,8 +519,48 @@ def _coherentkv_iter_rope_objects(model: Any) -> list[Any]:
     return rope_objects
 
 
+def _coherentkv_extend_rope_cache_if_needed(
+    rope: Any,
+    cos_sin_cache: torch.Tensor,
+    target_max_position_embeddings: int | None,
+) -> tuple[torch.Tensor | None, str | None]:
+    if (
+        target_max_position_embeddings is None
+        or target_max_position_embeddings <= int(cos_sin_cache.shape[0])
+    ):
+        return cos_sin_cache, None
+
+    compute_cache = getattr(rope, "_compute_cos_sin_cache", None)
+    old_max_position_embeddings = getattr(rope, "max_position_embeddings", None)
+    if not callable(compute_cache) or old_max_position_embeddings is None:
+        return (
+            None,
+            "rope_cache_too_short:"
+            f"{int(cos_sin_cache.shape[0])}<target{target_max_position_embeddings}",
+        )
+
+    try:
+        rope.max_position_embeddings = int(target_max_position_embeddings)
+        extended = compute_cache()
+    finally:
+        rope.max_position_embeddings = old_max_position_embeddings
+
+    if not torch.is_tensor(extended):
+        return None, "extended_rope_cache_not_tensor"
+    if extended.ndim != 2 or extended.shape[1] != cos_sin_cache.shape[1]:
+        return None, "extended_rope_cache_unexpected_shape"
+    if int(extended.shape[0]) < int(target_max_position_embeddings):
+        return (
+            None,
+            "extended_rope_cache_too_short:"
+            f"{int(extended.shape[0])}<target{target_max_position_embeddings}",
+        )
+    return extended.to(device=cos_sin_cache.device, dtype=cos_sin_cache.dtype), None
+
+
 def _coherentkv_extract_uniform_rope_state_from_model(
     model: Any,
+    target_max_position_embeddings: int | None = None,
 ) -> tuple[torch.Tensor | None, int, bool, list[str]]:
     """Extract one uniform standard RoPE state from a loaded vLLM model.
 
@@ -560,6 +600,14 @@ def _coherentkv_extract_uniform_rope_state_from_model(
         is_neox_style = bool(getattr(rope, "is_neox_style", True))
         if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != head_size:
             errors.append(f"rope_{index}:unexpected_cos_sin_shape")
+            continue
+        cos_sin_cache, extend_error = _coherentkv_extend_rope_cache_if_needed(
+            rope,
+            cos_sin_cache,
+            target_max_position_embeddings,
+        )
+        if extend_error or cos_sin_cache is None:
+            errors.append(f"rope_{index}:{extend_error}")
             continue
         signature = (
             head_size,
@@ -1135,8 +1183,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if mla_enabled(self._vllm_config.model_config):
             logger.info("Skipping CoherentKV CB RoPE model registration: MLA is unsupported")
             return False
+        target_max_position_embeddings = getattr(
+            self._vllm_config.model_config,
+            "max_model_len",
+            None,
+        )
         cos_sin_cache, head_size, is_neox_style, errors = (
-            _coherentkv_extract_uniform_rope_state_from_model(model)
+            _coherentkv_extract_uniform_rope_state_from_model(
+                model,
+                target_max_position_embeddings=target_max_position_embeddings,
+            )
         )
         if errors or cos_sin_cache is None:
             logger.info(
