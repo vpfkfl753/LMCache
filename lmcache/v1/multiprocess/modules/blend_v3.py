@@ -721,6 +721,21 @@ class BlendV3Module(InstanceLivenessTarget):
             else:
                 stale_hashes.append(r.hash)
 
+        if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+            logger.info(
+                "COHERENTKV sparse classify request=%s ranges=%s found_uidx=%s "
+                "expanded_uidx=%s found=%s stale=%s",
+                key.request_id,
+                [(r.old_st, r.old_ed, r.cur_st, r.cur_ed) for r in matches],
+                sorted(found_uidx),
+                expanded_uidx,
+                [
+                    (r.old_st, r.old_ed, r.cur_st, r.cur_ed)
+                    for r in found_cb_match_result
+                ],
+                len(stale_hashes),
+            )
+
         # Reset strikes for confirmed hashes.
         if found_cb_match_result:
             with self._pending_fp_lock:
@@ -1036,6 +1051,18 @@ class BlendV3Module(InstanceLivenessTarget):
             job.non_prefix = self._non_overlapping_after_prefix(
                 candidates, prefix_tokens
             )
+            if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+                logger.info(
+                    "COHERENTKV match ranges request=%s prefix_tokens=%d raw=%s "
+                    "nonprefix=%s",
+                    rid,
+                    prefix_tokens,
+                    [(r.old_st, r.old_ed, r.cur_st, r.cur_ed) for r in candidates],
+                    [
+                        (r.old_st, r.old_ed, r.cur_st, r.cur_ed)
+                        for r in job.non_prefix
+                    ],
+                )
             if job.non_prefix:
                 layout_desc = self._resolve_cb_layout_desc(
                     key.model_name, key.world_size
