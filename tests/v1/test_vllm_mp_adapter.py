@@ -376,6 +376,27 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def test_wait_for_retrieve_request_synchronizes_cuda_future(fake_adapter):
+    adapter, _send_mock, _future = fake_adapter
+    cuda_future = MagicMock(name="cuda_future")
+    cuda_future.result.return_value = True
+    adapter.retrieve_futures["req-1"] = (cuda_future, [7, 8])
+
+    assert adapter.wait_for_retrieve_request("req-1") is True
+    cuda_future.result.assert_called_once_with(timeout=adapter._mq_timeout)
+    assert adapter.get_block_ids_with_load_errors() == set()
+
+
+def test_wait_for_retrieve_request_fails_closed(fake_adapter):
+    adapter, _send_mock, _future = fake_adapter
+    cuda_future = MagicMock(name="cuda_future")
+    cuda_future.result.side_effect = TimeoutError("late scatter")
+    adapter.retrieve_futures["req-1"] = (cuda_future, [7, 8])
+
+    assert adapter.wait_for_retrieve_request("req-1") is False
+    assert adapter.get_block_ids_with_load_errors() == {7, 8}
+
+
 def test_instance_id_is_uuid_derived_63_bit_int(fake_adapter) -> None:
     """instance_id is a 63-bit int, not the PID, and unique per adapter."""
     adapter, _send_mock, _ = fake_adapter

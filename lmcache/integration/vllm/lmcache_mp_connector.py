@@ -1290,13 +1290,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             token_ids = list(meta.op.token_ids or ())
             self.coherentkv_span_only_retrieve_ids.add(meta.request_id)
-            self.worker_adapter.submit_cb_retrieve_pre_computed_v3_request(
+            submitted = self.worker_adapter.submit_cb_retrieve_pre_computed_v3_request(
                 meta.request_id,
                 token_ids,
                 meta.coherentkv_span_loads,
                 meta.coherentkv_full_block_ids,
                 event,
                 cache_salt=meta.cache_salt,
+            )
+            if not submitted or not self.worker_adapter.wait_for_retrieve_request(
+                meta.request_id
+            ):
+                self.coherentkv_span_only_retrieve_ids.discard(meta.request_id)
+                raise RuntimeError(
+                    "CoherentKV span-only retrieve did not complete before "
+                    "model forward "
+                    f"for request_id={meta.request_id}"
+                )
+            logger.info(
+                "CoherentKV synchronized span-only retrieve before model "
+                "forward for %s",
+                meta.request_id,
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:

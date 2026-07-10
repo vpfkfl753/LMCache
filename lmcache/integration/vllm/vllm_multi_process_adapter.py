@@ -1968,6 +1968,37 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_events[request_id] = event
         return True
 
+    def wait_for_retrieve_request(self, request_id: str) -> bool:
+        """Synchronize one submitted GPU retrieve before its KV is consumed."""
+        pending = self.retrieve_futures.get(request_id)
+        if pending is None:
+            logger.error("No pending retrieve exists for request_id=%s", request_id)
+            return False
+
+        future, block_ids = pending
+        try:
+            result = future.result(timeout=self._mq_timeout)
+        except TimeoutError:
+            self.error_block_ids.update(block_ids)
+            logger.error(
+                "Retrieve for request_id=%s did not complete within %ss",
+                request_id,
+                self._mq_timeout,
+            )
+            return False
+        except Exception:
+            self.error_block_ids.update(block_ids)
+            logger.exception(
+                "Retrieve synchronization failed for request_id=%s", request_id
+            )
+            return False
+
+        if not result:
+            self.error_block_ids.update(block_ids)
+            logger.error("Retrieve failed for request_id=%s", request_id)
+            return False
+        return True
+
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
         self,
