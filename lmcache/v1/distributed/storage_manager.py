@@ -6,6 +6,7 @@ Distributed multi-tier storage manager for MP mode
 # Standard
 from contextlib import contextmanager
 from typing import Iterator, Literal, Optional
+import os
 import threading
 import time
 
@@ -200,6 +201,13 @@ class StorageManager:
         result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
         successful_keys = list(result.keys())
         failed_keys = [k for k, (e, m) in reserve_result.items() if m is None]
+        if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+            logger.info(
+                "COHERENTKV reserve write requested=%s succeeded=%s failed=%s",
+                [str(key) for key in keys],
+                [str(key) for key in successful_keys],
+                [str(key) for key in failed_keys],
+            )
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_RESERVED,
@@ -237,6 +245,12 @@ class StorageManager:
         finish_result = self._l1_manager.finish_write(keys)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+            logger.info(
+                "COHERENTKV finish write succeeded=%s failed=%s",
+                [str(key) for key in successful_keys],
+                [str(key) for key in failed_keys],
+            )
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_FINISHED,
