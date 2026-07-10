@@ -268,3 +268,28 @@ def test_prefix_certificate_path_mismatch_fails_closed() -> None:
 
     assert plan.decisions[0].reason == "certificate_path_mismatch"
     assert plan.recompute_intervals == [TokenInterval(0, 8)]
+
+
+def test_string_false_parity_does_not_admit() -> None:
+    candidate = prefix_candidate("prefix", 0, 4)
+    certificate = {
+        **candidate.compatibility_certificate,
+        "source_dirty": "false",
+        "output_parity_validated": "false",
+        "logit_diff_validated": "true",
+    }
+    candidate = SpanAdmissionCandidate(
+        **{
+            **candidate.__dict__,
+            "compatibility_certificate": certificate,
+        }
+    )
+
+    plan = build_span_admission_plan(
+        candidates=[candidate],
+        request_snapshot={"repo": "r1"},
+        total_context_tokens=8,
+    )
+
+    assert plan.decisions[0].reason == "missing_output_parity"
+    assert plan.recompute_intervals == [TokenInterval(0, 8)]

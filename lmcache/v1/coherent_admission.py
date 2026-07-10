@@ -32,6 +32,21 @@ PATH_KEY_FIELDS = (
 )
 
 
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "pass", "validated"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "", "fail"}:
+        return False
+    return default
+
+
 def _canonical_value(value: Any) -> str:
     if value is None:
         return ""
@@ -49,7 +64,18 @@ def normalize_path_key(raw: Mapping[str, Any] | None) -> dict[str, str]:
 
 def missing_path_key_fields(raw: Mapping[str, Any] | None) -> tuple[str, ...]:
     normalized = normalize_path_key(raw)
-    return tuple(field for field, value in normalized.items() if not value)
+    missing = []
+    for field, value in normalized.items():
+        lowered = value.lower()
+        unresolved = (
+            lowered in {"unknown", "unresolved"}
+            or lowered.endswith("@unresolved")
+            or lowered.startswith("unknown-")
+            or (field == "attention_backend" and lowered == "auto")
+        )
+        if not value or unresolved:
+            missing.append(field)
+    return tuple(missing)
 
 
 def path_key_digest(raw: Mapping[str, Any] | None) -> str:
@@ -85,13 +111,19 @@ class CompatibilityCertificate:
         return cls(
             certificate_id=str(raw.get("certificate_id") or ""),
             status=str(raw.get("status") or ""),
-            path_key=raw.get("path_key") or {},
+            path_key=(
+                raw.get("path_key")
+                if isinstance(raw.get("path_key"), Mapping)
+                else {}
+            ),
             allowed_execution_classes=tuple(str(value) for value in allowed),
             source_commit=str(raw.get("source_commit") or ""),
-            source_dirty=bool(raw.get("source_dirty", True)),
-            output_parity_validated=bool(raw.get("output_parity_validated", False)),
-            logit_diff_validated=bool(raw.get("logit_diff_validated", False)),
-            approximate=bool(raw.get("approximate", False)),
+            source_dirty=_coerce_bool(raw.get("source_dirty"), default=True),
+            output_parity_validated=_coerce_bool(
+                raw.get("output_parity_validated")
+            ),
+            logit_diff_validated=_coerce_bool(raw.get("logit_diff_validated")),
+            approximate=_coerce_bool(raw.get("approximate")),
         )
 
 

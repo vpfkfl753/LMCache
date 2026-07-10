@@ -127,3 +127,16 @@ def test_dirty_diagnostic_certificate_fails_closed() -> None:
     assert plan.decisions[0].execution_class == EXECUTION_C0
     assert plan.decisions[0].reason == "dirty_certificate_source"
     assert _coherentkv_mp_admitted_nonprefix_span_matches(plan, 0) == ()
+
+
+def test_string_false_commit_flag_fails_closed() -> None:
+    config = request_config(strict=False)
+    config[COHERENTKV_SPAN_COMMITTED_KEY] = {"16:32": "false"}
+    plan = _build_coherentkv_mp_admission_plan(
+        span_result(),
+        config,
+        RUNTIME_PATH_BASE,
+    )
+
+    assert plan.decisions[0].execution_class == EXECUTION_C0
+    assert plan.decisions[0].reason == "not_committed"

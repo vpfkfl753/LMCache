@@ -361,7 +361,7 @@ def _build_coherentkv_mp_admission_plan(
             )
         )
         has_declared_deps = bool(cached_deps)
-        committed = bool(
+        committed = _coerce_bool(
             _lookup_span_metadata(
                 committed_by_span,
                 span.start,
@@ -370,7 +370,7 @@ def _build_coherentkv_mp_admission_plan(
                 False,
             )
         )
-        compatible = bool(
+        compatible = _coerce_bool(
             _lookup_span_metadata(
                 compatible_by_span,
                 span.start,
