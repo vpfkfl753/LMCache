@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 import enum
+import json
 import math
 import sys
 
@@ -58,8 +59,13 @@ from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
 from lmcache.utils import _lmcache_nvtx_annotate, init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 from lmcache.v1.coherent_admission import (
+    EXECUTION_C0,
+    EXECUTION_C1,
+    EXECUTION_F,
     SpanAdmissionCandidate,
     build_span_admission_plan,
+    execution_class_for,
+    path_key_digest,
     validate_span_admission_plan,
 )
 
@@ -194,6 +200,11 @@ COHERENTKV_SPAN_DEPS_KEY = "lmcache.coherentkv.span_deps"
 COHERENTKV_SPAN_COMMITTED_KEY = "lmcache.coherentkv.span_committed"
 COHERENTKV_SPAN_COMPATIBLE_KEY = "lmcache.coherentkv.span_compatible"
 COHERENTKV_SPAN_PUBLISH_PROOFS_KEY = "lmcache.coherentkv.span_publish_proofs"
+COHERENTKV_STRICT_MODE_KEY = "lmcache.coherentkv.strict_mode"
+COHERENTKV_ALLOW_APPROXIMATE_KEY = "lmcache.coherentkv.allow_approximate_nonprefix"
+COHERENTKV_DIAGNOSTIC_MODE_KEY = "lmcache.coherentkv.diagnostic_mode"
+COHERENTKV_RUNTIME_PATH_KEY = "lmcache.coherentkv.runtime_path_key"
+COHERENTKV_SPAN_CERTIFICATES_KEY = "lmcache.coherentkv.span_compatibility_certificates"
 
 
 def _coherentkv_extract_request_configs(request: Any) -> dict[str, Any] | None:
@@ -220,6 +231,46 @@ def _coerce_str_mapping(raw: Any) -> dict[str, str]:
     return {str(key): str(value) for key, value in raw.items()}
 
 
+def _coerce_bool(raw: Any, *, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _coerce_path_mapping(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): value for key, value in raw.items()}
+
+
+def _coherentkv_span_classes(
+    span: Any,
+    span_metadata: dict[str, str],
+) -> tuple[str, str]:
+    destination_start = int(span.start)
+    source_start_raw = span_metadata.get("coherentkv_source_start_token")
+    try:
+        source_start = (
+            destination_start if source_start_raw is None else int(source_start_raw)
+        )
+    except (TypeError, ValueError):
+        return "unknown", "unknown"
+    if destination_start == 0 and source_start == 0:
+        return "exact_prefix_tensor", "exact_prefix_hit"
+    if source_start != destination_start:
+        return "shifted_nonprefix_tensor", "selective_nonprefix_hit"
+    return "same_position_nonprefix_tensor", "selective_nonprefix_hit"
+
+
 def _coherentkv_span_key(start: int, end: int, key_index: Any) -> list[str]:
     keys = [f"{start}:{end}"]
     if key_index is not None:
@@ -242,7 +293,11 @@ def _lookup_span_metadata(
     return default
 
 
-def _build_coherentkv_mp_admission_plan(span_result: Any, request_configs: dict[str, Any]) -> Any:
+def _build_coherentkv_mp_admission_plan(
+    span_result: Any,
+    request_configs: dict[str, Any],
+    runtime_path_base: dict[str, Any] | None = None,
+) -> Any:
     request_snapshot = _coerce_str_mapping(
         request_configs.get(COHERENTKV_REQUEST_SNAPSHOT_KEY)
     )
@@ -250,12 +305,43 @@ def _build_coherentkv_mp_admission_plan(span_result: Any, request_configs: dict[
     committed_by_span = request_configs.get(COHERENTKV_SPAN_COMMITTED_KEY, {})
     compatible_by_span = request_configs.get(COHERENTKV_SPAN_COMPATIBLE_KEY, {})
     publish_proofs_by_span = request_configs.get(COHERENTKV_SPAN_PUBLISH_PROOFS_KEY, {})
+    certificates_by_span = request_configs.get(COHERENTKV_SPAN_CERTIFICATES_KEY, {})
+    strict_mode = _coerce_bool(
+        request_configs.get(COHERENTKV_STRICT_MODE_KEY),
+        default=True,
+    )
+    allow_approximate = _coerce_bool(
+        request_configs.get(COHERENTKV_ALLOW_APPROXIMATE_KEY),
+        default=False,
+    )
+    diagnostic_mode = _coerce_bool(
+        request_configs.get(COHERENTKV_DIAGNOSTIC_MODE_KEY),
+        default=False,
+    )
 
     candidates: list[SpanAdmissionCandidate] = []
     for span in getattr(span_result, "spans", ()):
         if not getattr(span, "hit", False):
             continue
         span_metadata = _coerce_str_mapping(getattr(span, "metadata", {}))
+        physical_class, cache_state_class = _coherentkv_span_classes(
+            span,
+            span_metadata,
+        )
+        runtime_path_key = {
+            **(runtime_path_base or {}),
+            "physical_class": physical_class,
+            "cache_state_class": cache_state_class,
+        }
+        certificate = _lookup_span_metadata(
+            certificates_by_span,
+            span.start,
+            span.end,
+            span.key_index,
+            {},
+        )
+        if not isinstance(certificate, dict):
+            certificate = {}
         publish_proof_metadata = _coerce_str_mapping(
             _lookup_span_metadata(
                 publish_proofs_by_span,
@@ -293,23 +379,45 @@ def _build_coherentkv_mp_admission_plan(span_result: Any, request_configs: dict[
                 False,
             )
         )
-        candidates.append(
-            SpanAdmissionCandidate(
-                name=f"mp-span:{span.start}:{span.end}",
-                start_token=int(span.start),
-                end_token=int(span.end),
-                committed=committed and has_declared_deps,
-                compatible=compatible,
-                cached_deps=cached_deps,
-                metadata={
-                    **span_metadata,
-                    **publish_proof_metadata,
-                    "key_index": "" if span.key_index is None else str(span.key_index),
-                    "missing_declared_deps": str(not has_declared_deps).lower(),
-                    "coherentkv_mp_cb_unified_lookup": "true",
-                },
-            )
+        candidate_metadata = {
+            **span_metadata,
+            **publish_proof_metadata,
+            "key_index": "" if span.key_index is None else str(span.key_index),
+            "missing_declared_deps": str(not has_declared_deps).lower(),
+            "coherentkv_mp_cb_unified_lookup": "true",
+            "coherentkv_physical_class": physical_class,
+            "coherentkv_cache_state_class": cache_state_class,
+            "coherentkv_strict_mode": str(strict_mode).lower(),
+            "coherentkv_approximate_opt_in": str(allow_approximate).lower(),
+            "coherentkv_diagnostic_mode": str(diagnostic_mode).lower(),
+            "coherentkv_path_key_sha256": path_key_digest(runtime_path_key),
+            "coherentkv_certificate_id": str(
+                certificate.get("certificate_id") or ""
+            ),
+            "coherentkv_certificate_status": str(
+                certificate.get("status") or ""
+            ),
+        }
+        candidate = SpanAdmissionCandidate(
+            name=f"mp-span:{span.start}:{span.end}",
+            start_token=int(span.start),
+            end_token=int(span.end),
+            committed=committed and has_declared_deps,
+            compatible=compatible,
+            cached_deps=cached_deps,
+            metadata=candidate_metadata,
+            physical_class=physical_class,
+            cache_state_class=cache_state_class,
+            strict_mode=strict_mode,
+            allow_approximate_nonprefix=allow_approximate,
+            diagnostic_mode=diagnostic_mode,
+            runtime_path_key=runtime_path_key,
+            compatibility_certificate=certificate,
         )
+        candidate_metadata["coherentkv_planned_execution_class"] = execution_class_for(
+            candidate
+        )
+        candidates.append(candidate)
 
     return build_span_admission_plan(
         candidates=candidates,
@@ -324,10 +432,14 @@ def _build_coherentkv_mp_admission_plan(span_result: Any, request_configs: dict[
 def _coherentkv_admitted_prefix_tokens(plan: Any) -> int:
     prefix = 0
     admitted = sorted(
-        [decision.candidate for decision in plan.decisions if decision.admitted],
-        key=lambda candidate: (candidate.start_token, candidate.end_token),
+        [decision for decision in plan.decisions if decision.admitted],
+        key=lambda decision: (
+            decision.candidate.start_token,
+            decision.candidate.end_token,
+        ),
     )
-    for candidate in admitted:
+    for decision in admitted:
+        candidate = decision.candidate
         if candidate.start_token != prefix:
             break
         prefix = candidate.end_token
@@ -348,10 +460,14 @@ def _coherentkv_mp_admitted_nonprefix_span_matches(
         return ()
     span_matches = []
     admitted = sorted(
-        [decision.candidate for decision in plan.decisions if decision.admitted],
-        key=lambda candidate: (candidate.start_token, candidate.end_token),
+        [decision for decision in plan.decisions if decision.admitted],
+        key=lambda decision: (
+            decision.candidate.start_token,
+            decision.candidate.end_token,
+        ),
     )
-    for candidate in admitted:
+    for decision in admitted:
+        candidate = decision.candidate
         if candidate.end_token <= prefix_frontier:
             continue
         if candidate.start_token < prefix_frontier:
@@ -360,6 +476,10 @@ def _coherentkv_mp_admitted_nonprefix_span_matches(
         if not metadata.get("coherentkv_cb_hash_hex"):
             continue
         metadata["coherentkv_admitted"] = "true"
+        metadata["coherentkv_execution_class"] = decision.execution_class
+        metadata["coherentkv_approximate"] = str(
+            decision.execution_class == EXECUTION_F
+        ).lower()
         span_matches.append(
             KVConnectorSpanMatch(
                 start_token=candidate.start_token,
@@ -427,6 +547,28 @@ def _coherentkv_has_parity_publish_proof(metadata: Any) -> bool:
     )
 
 
+def _coherentkv_has_execution_publish_proof(metadata: Any) -> bool:
+    if not hasattr(metadata, "get"):
+        return False
+    execution_class = str(metadata.get("coherentkv_execution_class") or "")
+    if execution_class == EXECUTION_C1:
+        return _coherentkv_has_parity_publish_proof(metadata)
+    if execution_class != EXECUTION_F:
+        return False
+    if not _coherentkv_publish_metadata_truthy(
+        metadata,
+        "coherentkv_approximate",
+        "coherentkv_approximate_opt_in",
+    ):
+        return False
+    if _coherentkv_publish_metadata_truthy(metadata, "coherentkv_strict_mode"):
+        return False
+    return bool(
+        metadata.get("coherentkv_certificate_id")
+        and metadata.get("coherentkv_path_key_sha256")
+    )
+
+
 def _coherentkv_copy_span_load_with_metadata(span_load: Any, metadata: dict[str, str]) -> Any:
     try:
         return replace(span_load, metadata=metadata)
@@ -443,13 +585,13 @@ def _coherentkv_publish_proof_span_loads(
     span_load_plan: Any,
     total_token_count: int | None,
 ) -> tuple[Any, ...]:
-    """Return only spans with admission, gap, parity, and artifact proofs.
+    """Return only spans with admission, gap, and execution-path proofs.
 
     Gap proof is not trusted from request metadata. It is stamped here only
     after the vLLM load plan computes a valid recompute complement for the
-    current request token count. Parity proof is external: it must already be
-    present as metadata from a parity artifact, and missing parity keeps the span
-    on the recompute path.
+    current request token count. C1 requires an external parity artifact. F
+    requires an explicit approximate opt-in and path-bound certificate instead;
+    it remains ineligible for strict claims.
     """
 
     if total_token_count is None or not hasattr(span_load_plan, "to_recompute_gaps"):
@@ -470,7 +612,7 @@ def _coherentkv_publish_proof_span_loads(
             continue
         if not _coherentkv_publish_metadata_truthy(metadata, "coherentkv_admitted"):
             continue
-        if not _coherentkv_has_parity_publish_proof(metadata):
+        if not _coherentkv_has_execution_publish_proof(metadata):
             continue
         metadata.update(
             {
@@ -988,6 +1130,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         validate_kv_cache_groups(getattr(self, "_kv_cache_config", None))
 
         assert vllm_config.kv_transfer_config is not None
+        self._coherentkv_runtime_path_base = _coerce_path_mapping(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                COHERENTKV_RUNTIME_PATH_KEY,
+                {},
+            )
+        )
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1510,6 +1658,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     plan = _build_coherentkv_mp_admission_plan(
                         span_result,
                         request_configs or {},
+                        self._coherentkv_runtime_path_base,
                     )
                     validation_errors = validate_span_admission_plan(plan)
                     if validation_errors:
@@ -1530,6 +1679,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                             **metadata,
                             "coherentkv_mp_admission": "validated",
                             "nonprefix_span_count": str(len(nonprefix_spans)),
+                            "execution_classes": json.dumps(
+                                [
+                                    decision.execution_class
+                                    for decision in plan.decisions
+                                ],
+                                sort_keys=True,
+                            ),
+                            "decision_reasons": json.dumps(
+                                [decision.reason for decision in plan.decisions],
+                                sort_keys=True,
+                            ),
                         }
                 else:
                     metadata = {

@@ -34,6 +34,10 @@ from lmcache.v1.span_lookup import (
     intersect_span_lookup_results,
     span_lookup_result_from_cb_unified_lookup,
 )
+from lmcache.v1.coherent_admission import (
+    EXECUTION_C1,
+    EXECUTION_F,
+)
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -73,9 +77,10 @@ def _coherentkv_validate_cb_v3_publish_span_metadata(
     """Fail-closed proof gate before lowering spans to Blend V3 matches.
 
     The worker submit path can only publish non-prefix KV when every span has:
-    destination blocks, CB hash metadata, an admission proof, recompute-gap proof,
-    and a parity proof artifact.  Missing or malformed metadata means the caller
-    must recompute instead of publishing.
+    destination blocks, CB hash metadata, admission and recompute-gap proofs,
+    and one explicit execution proof. C1 requires parity evidence. F requires
+    an approximate opt-in plus a path-bound certificate and can never carry a
+    strict label. Missing or malformed metadata means the caller must recompute.
     """
 
     if not span_loads:
@@ -116,13 +121,33 @@ def _coherentkv_validate_cb_v3_publish_span_metadata(
             "coherentkv_recompute_gap_validated",
         ):
             errors.append(f"span_{index}:missing_recompute_gap_validation_proof")
-        if not _coherentkv_metadata_truthy(metadata, "coherentkv_parity_validated"):
-            errors.append(f"span_{index}:missing_parity_validation_proof")
-        parity_artifact = metadata.get("coherentkv_parity_artifact_id") or metadata.get(
-            "coherentkv_parity_artifact"
-        )
-        if not parity_artifact:
-            errors.append(f"span_{index}:missing_parity_artifact_id")
+        execution_class = str(metadata.get("coherentkv_execution_class") or "")
+        if execution_class == EXECUTION_C1:
+            if not _coherentkv_metadata_truthy(
+                metadata,
+                "coherentkv_parity_validated",
+            ):
+                errors.append(f"span_{index}:missing_parity_validation_proof")
+            parity_artifact = metadata.get(
+                "coherentkv_parity_artifact_id"
+            ) or metadata.get("coherentkv_parity_artifact")
+            if not parity_artifact:
+                errors.append(f"span_{index}:missing_parity_artifact_id")
+        elif execution_class == EXECUTION_F:
+            if not _coherentkv_metadata_truthy(
+                metadata,
+                "coherentkv_approximate",
+                "coherentkv_approximate_opt_in",
+            ):
+                errors.append(f"span_{index}:missing_approximate_opt_in")
+            if _coherentkv_metadata_truthy(metadata, "coherentkv_strict_mode"):
+                errors.append(f"span_{index}:approximate_path_marked_strict")
+            if not metadata.get("coherentkv_certificate_id"):
+                errors.append(f"span_{index}:missing_compatibility_certificate_id")
+            if not metadata.get("coherentkv_path_key_sha256"):
+                errors.append(f"span_{index}:missing_path_key_digest")
+        else:
+            errors.append(f"span_{index}:unsupported_execution_class:{execution_class}")
 
     return not errors, errors
 

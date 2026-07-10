@@ -8,8 +8,91 @@ range to be recomputed.
 """
 
 # Standard
+import hashlib
+import json
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping, Sequence
+
+
+EXECUTION_C0 = "C0_dense_recompute"
+EXECUTION_C1 = "C1_exact_prefix_dense_suffix"
+EXECUTION_F = "F_approximate_selective_nonprefix"
+
+PATH_KEY_FIELDS = (
+    "model_fp",
+    "tokenizer_fp",
+    "adapter_fp",
+    "dtype",
+    "rotary_config",
+    "engine_commit",
+    "attention_backend",
+    "kernel_config",
+    "physical_class",
+    "cache_state_class",
+)
+
+
+def _canonical_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list, tuple, bool, int, float)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return str(value).strip()
+
+
+def normalize_path_key(raw: Mapping[str, Any] | None) -> dict[str, str]:
+    source = raw or {}
+    return {field: _canonical_value(source.get(field)) for field in PATH_KEY_FIELDS}
+
+
+def missing_path_key_fields(raw: Mapping[str, Any] | None) -> tuple[str, ...]:
+    normalized = normalize_path_key(raw)
+    return tuple(field for field, value in normalized.items() if not value)
+
+
+def path_key_digest(raw: Mapping[str, Any] | None) -> str:
+    payload = json.dumps(
+        normalize_path_key(raw),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class CompatibilityCertificate:
+    certificate_id: str
+    status: str
+    path_key: Mapping[str, Any]
+    allowed_execution_classes: Sequence[str]
+    source_commit: str
+    source_dirty: bool = True
+    output_parity_validated: bool = False
+    logit_diff_validated: bool = False
+    approximate: bool = False
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, Any] | None
+    ) -> "CompatibilityCertificate | None":
+        if not raw:
+            return None
+        allowed = raw.get("allowed_execution_classes") or ()
+        if isinstance(allowed, str):
+            allowed = (allowed,)
+        return cls(
+            certificate_id=str(raw.get("certificate_id") or ""),
+            status=str(raw.get("status") or ""),
+            path_key=raw.get("path_key") or {},
+            allowed_execution_classes=tuple(str(value) for value in allowed),
+            source_commit=str(raw.get("source_commit") or ""),
+            source_dirty=bool(raw.get("source_dirty", True)),
+            output_parity_validated=bool(raw.get("output_parity_validated", False)),
+            logit_diff_validated=bool(raw.get("logit_diff_validated", False)),
+            approximate=bool(raw.get("approximate", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -23,6 +106,13 @@ class SpanAdmissionCandidate:
     compatible: bool
     cached_deps: Mapping[str, str]
     metadata: Mapping[str, str] = field(default_factory=dict)
+    physical_class: str = "unknown"
+    cache_state_class: str = "unknown"
+    strict_mode: bool = True
+    allow_approximate_nonprefix: bool = False
+    diagnostic_mode: bool = False
+    runtime_path_key: Mapping[str, Any] = field(default_factory=dict)
+    compatibility_certificate: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def token_count(self) -> int:
@@ -39,6 +129,12 @@ class SpanDecision:
     @property
     def admitted(self) -> bool:
         return self.reason == "admit"
+
+    @property
+    def execution_class(self) -> str:
+        if not self.admitted:
+            return EXECUTION_C0
+        return execution_class_for(self.candidate)
 
 
 @dataclass(frozen=True)
@@ -78,6 +174,66 @@ class SpanAdmissionPlan:
         return sum(interval.token_count for interval in self.recompute_intervals)
 
 
+def execution_class_for(candidate: SpanAdmissionCandidate) -> str:
+    exact_prefix = (
+        candidate.start_token == 0
+        and candidate.physical_class == "exact_prefix_tensor"
+        and candidate.cache_state_class == "exact_prefix_hit"
+    )
+    if exact_prefix:
+        return EXECUTION_C1
+    if not candidate.strict_mode and candidate.allow_approximate_nonprefix:
+        return EXECUTION_F
+    return EXECUTION_C0
+
+
+def compatibility_reason(candidate: SpanAdmissionCandidate) -> str | None:
+    execution_class = execution_class_for(candidate)
+    if execution_class == EXECUTION_C0:
+        if candidate.start_token == 0:
+            return "uncertified_prefix_class"
+        return "strict_nonprefix_requires_dense_recompute"
+    missing = missing_path_key_fields(candidate.runtime_path_key)
+    if missing:
+        return "incomplete_path_key:" + ",".join(missing)
+    certificate = CompatibilityCertificate.from_mapping(
+        candidate.compatibility_certificate
+    )
+    if certificate is None:
+        return "missing_compatibility_certificate"
+    if not certificate.certificate_id:
+        return "missing_certificate_id"
+    if not certificate.source_commit:
+        return "missing_certificate_source_commit"
+    if certificate.source_dirty:
+        return "dirty_certificate_source"
+    certificate_missing = missing_path_key_fields(certificate.path_key)
+    if certificate_missing:
+        return "incomplete_certificate_key:" + ",".join(certificate_missing)
+    if normalize_path_key(certificate.path_key) != normalize_path_key(
+        candidate.runtime_path_key
+    ):
+        return "certificate_path_mismatch"
+    if execution_class not in certificate.allowed_execution_classes:
+        return "certificate_execution_class_mismatch"
+    if execution_class == EXECUTION_C1:
+        if certificate.status != "pass":
+            return "certificate_not_passed"
+        if not certificate.output_parity_validated:
+            return "missing_output_parity"
+        if not certificate.logit_diff_validated:
+            return "missing_logit_bound"
+    else:
+        allowed_statuses = {"pass"}
+        if candidate.diagnostic_mode:
+            allowed_statuses.add("diagnostic")
+        if certificate.status not in allowed_statuses:
+            return "approximate_certificate_not_enabled"
+        if not certificate.approximate:
+            return "approximate_label_missing"
+    return None
+
+
 def admission_reason(
     candidate: SpanAdmissionCandidate,
     request_snapshot: Mapping[str, str],
@@ -94,6 +250,9 @@ def admission_reason(
             return f"missing_snapshot_dep:{artifact_id}:{cached_version}"
         if request_version != cached_version:
             return f"stale:{artifact_id}:{cached_version}->{request_version}"
+    physical_reason = compatibility_reason(candidate)
+    if physical_reason:
+        return physical_reason
     return "admit"
 
 
