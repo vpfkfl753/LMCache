@@ -126,6 +126,57 @@ def test_fingerprint_worker_stops_on_signal():
     assert not worker.is_alive()
 
 
+def test_store_recovers_fingerprints_after_end_session_race():
+    """A concurrent END_SESSION must not register hashes of empty chunks."""
+    # Standard
+    from queue import Queue
+
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+    from lmcache.v1.multiprocess.modules import blend_v3 as v3_mod
+    from lmcache.v1.multiprocess.session import SessionManager
+    from lmcache.v1.multiprocess.token_hasher import TokenHasher
+
+    hasher = TokenHasher(chunk_size=4, hash_algorithm="blake3")
+    sessions = SessionManager(hasher, cleanup_interval=None)
+    tokens = list(range(8))
+    session = sessions.get_or_create("req-race")
+    session.set_tokens(tokens)
+    session.get_hashes(0, 8)
+
+    engine = v3_mod.BlendV3Module.__new__(v3_mod.BlendV3Module)
+    engine._ctx = SimpleNamespace(session_manager=sessions, token_hasher=hasher)
+    engine._transfer_module = MagicMock()
+    engine._fingerprint_queue = Queue()
+    engine._pending_fp_lock = threading.Lock()
+    engine._pending_fp_hashes = set()
+    engine._coordinator = None
+
+    def store_then_end(*_args):
+        sessions.remove("req-race")
+        return b"event", True
+
+    engine._transfer_module.store.side_effect = store_then_end
+    engine._transfer_module.get_and_touch_context_entry.return_value = None
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="model",
+        world_size=1,
+        worker_id=0,
+        token_ids=tokens,
+        start=0,
+        end=8,
+        request_id="req-race",
+    )
+
+    assert engine.store(key, 1, [], b"producer-event") == (b"event", True)
+    _, chunk_hashes, start_chunk_idx, position_offset = (
+        engine._fingerprint_queue.get_nowait()
+    )
+    assert chunk_hashes == hasher.compute_chunk_hashes(tokens)
+    assert start_chunk_idx == 1
+    assert position_offset == 0
+
+
 # ---------------------------------------------------------------------------
 # L2: obj_keys cache lifecycle
 # ---------------------------------------------------------------------------

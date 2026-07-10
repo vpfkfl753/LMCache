@@ -51,6 +51,27 @@ class Session:
             full_token_ids: Complete token sequence.
         """
         with self._lock:
+            if self.token_ids == full_token_ids:
+                return
+
+            shared_tokens = 0
+            shared_limit = min(len(self.token_ids), len(full_token_ids))
+            while (
+                shared_tokens < shared_limit
+                and self.token_ids[shared_tokens] == full_token_ids[shared_tokens]
+            ):
+                shared_tokens += 1
+
+            retained_chunks = min(
+                shared_tokens // self.hasher.chunk_size,
+                self.num_chunks_processed,
+            )
+            if retained_chunks < self.num_chunks_processed:
+                self.chunk_hashes = self.chunk_hashes[:retained_chunks]
+                self.num_chunks_processed = retained_chunks
+                self.last_prefix_hash = (
+                    self.chunk_hashes[-1] if self.chunk_hashes else None
+                )
             self.token_ids = full_token_ids
 
     @overload
@@ -94,6 +115,10 @@ class Session:
             assert end % chunk_size == 0, (
                 f"end ({end}) must be a multiple of chunk_size ({chunk_size})"
             )
+            if end > len(self.token_ids):
+                raise ValueError(
+                    f"end ({end}) exceeds session token count ({len(self.token_ids)})"
+                )
             end_chunk = end // chunk_size
             self._compute_hash(end_chunk)
             return self.chunk_hashes[start_chunk:end_chunk]

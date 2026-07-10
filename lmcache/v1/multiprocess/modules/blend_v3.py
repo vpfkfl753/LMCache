@@ -548,7 +548,8 @@ class BlendV3Module(InstanceLivenessTarget):
                 break
             tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
             logger.info(
-                "COHERENTKV sync fingerprint drain tokens=%d hashes=%d start_chunk=%d offset=%d",
+                "COHERENTKV sync fingerprint drain tokens=%d hashes=%d "
+                "start_chunk=%d offset=%d",
                 len(tokens_in_range),
                 len(chunk_hashes),
                 start_chunk_idx,
@@ -939,7 +940,8 @@ class BlendV3Module(InstanceLivenessTarget):
         rid = key.request_id
         chunk_size = self._ctx.chunk_size
         logger.info(
-            "COHERENTKV CB_UNIFIED_LOOKUP request=%s tokens=%d model=%s ws=%d sample71=%s",
+            "COHERENTKV CB_UNIFIED_LOOKUP request=%s tokens=%d model=%s "
+            "ws=%d sample71=%s",
             rid,
             len(key.token_ids),
             key.model_name,
@@ -1227,7 +1229,8 @@ class BlendV3Module(InstanceLivenessTarget):
             (event handle, success).
         """
         logger.info(
-            "COHERENTKV BlendV3 store wrapper request=%s start=%d end=%d worker=%s sample128=%s",
+            "COHERENTKV BlendV3 store wrapper request=%s start=%d end=%d "
+            "worker=%s sample128=%s",
             key.request_id,
             key.start,
             key.end,
@@ -1237,6 +1240,12 @@ class BlendV3Module(InstanceLivenessTarget):
         result = self._transfer_module.store(
             key, instance_id, gpu_block_ids, event_ipc_handle
         )
+        if not result[1]:
+            logger.warning(
+                "COHERENTKV skipping fingerprints after failed store request=%s",
+                key.request_id,
+            )
+            return result
 
         # The matcher is engine-shared; only worker 0 registers.
         if key.worker_id not in (0, None):
@@ -1247,10 +1256,24 @@ class BlendV3Module(InstanceLivenessTarget):
         # not-yet-committed and drop the whole group as stale.
         try:
             session = self._ctx.session_manager.get_or_create(key.request_id)
-            chunk_hashes = [
-                TokenHasher.hash_to_bytes(h)
-                for h in session.get_hashes(key.start, key.end)
-            ]
+            try:
+                chunk_hashes = [
+                    TokenHasher.hash_to_bytes(h)
+                    for h in session.get_hashes(key.start, key.end)
+                ]
+            except ValueError:
+                # END_SESSION may remove the request session while the GPU store
+                # is still completing. Never manufacture hashes from the fresh,
+                # empty replacement session; derive them from the immutable key.
+                chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                    list(key.token_ids),
+                    start=key.start,
+                    end=key.end,
+                )
+                logger.info(
+                    "COHERENTKV store fingerprint recovered from key request=%s",
+                    key.request_id,
+                )
             if (
                 os.getenv("COHERENTKV_EAGER_CB_FP_REGISTER") == "1"
                 or not chunk_hashes
@@ -1470,7 +1493,8 @@ class BlendV3Module(InstanceLivenessTarget):
                 continue
             tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
             logger.info(
-                "COHERENTKV async fingerprint drain tokens=%d hashes=%d start_chunk=%d offset=%d",
+                "COHERENTKV async fingerprint drain tokens=%d hashes=%d "
+                "start_chunk=%d offset=%d",
                 len(tokens_in_range),
                 len(chunk_hashes),
                 start_chunk_idx,

@@ -40,11 +40,27 @@ class TestSession:
         session.set_tokens([4, 5, 6])
         assert session.token_ids == [4, 5, 6]
 
+    def test_set_tokens_invalidates_changed_chunks(self, session: Session) -> None:
+        session.set_tokens(list(range(8)))
+        old_hashes = session.get_hashes(0, 8)
+
+        replacement = list(range(4)) + [40, 41, 42, 43]
+        session.set_tokens(replacement)
+        new_hashes = session.get_hashes(0, 8)
+
+        assert new_hashes[0] == old_hashes[0]
+        assert new_hashes[1] != old_hashes[1]
+        assert new_hashes == session.hasher.compute_chunk_hashes(replacement)
+
     def test_get_hashes_basic(self, session: Session) -> None:
         """8 tokens, chunk_size=4 produces 2 hashes."""
         session.set_tokens(list(range(8)))
         hashes = session.get_hashes(0, 8)
         assert len(hashes) == 2
+
+    def test_get_hashes_rejects_range_beyond_tokens(self, session: Session) -> None:
+        with pytest.raises(ValueError, match="exceeds session token count"):
+            session.get_hashes(0, 8)
 
     def test_get_hashes_incremental(self, session: Session) -> None:
         """Calling get_hashes incrementally should produce same results."""
