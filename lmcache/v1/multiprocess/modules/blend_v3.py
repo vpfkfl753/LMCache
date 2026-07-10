@@ -685,6 +685,20 @@ class BlendV3Module(InstanceLivenessTarget):
             external_request_id=key.request_id,
             policy=TrimPolicy.SPARSE,
         )
+        if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+            logger.info(
+                "COHERENTKV sparse keys request=%s model=%s world=%d worker=%s "
+                "salt=%r hashes=%s keys=%s l1_found=%s l2_indices=%s",
+                key.request_id,
+                key.model_name,
+                key.world_size,
+                key.worker_id,
+                key.cache_salt,
+                [h.hex() for h in all_hashes],
+                [str(obj_key) for obj_key in uniq_keys],
+                list(handle.l1_found_indices),
+                list(handle.l2_orig_indices),
+            )
         return handle, per_hash_obj_keys, expanded_uidx
 
     def _sparse_classify(
@@ -1251,6 +1265,19 @@ class BlendV3Module(InstanceLivenessTarget):
                 len(chunk_hashes),
                 os.getenv("COHERENTKV_EAGER_CB_FP_REGISTER"),
             )
+            if os.getenv("COHERENTKV_DEBUG_MATCH_RANGES") == "1":
+                logger.info(
+                    "COHERENTKV store keys request=%s model=%s world=%d worker=%s "
+                    "salt=%r start=%d end=%d hashes=%s",
+                    key.request_id,
+                    key.model_name,
+                    key.world_size,
+                    key.worker_id,
+                    key.cache_salt,
+                    key.start,
+                    key.end,
+                    [chunk_hash.hex() for chunk_hash in chunk_hashes],
+                )
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
